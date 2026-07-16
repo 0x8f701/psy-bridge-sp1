@@ -8,6 +8,10 @@ autobins = false
 name = "block-transition"
 path = "src/bin/block_transition.rs"
 
+[[bin]]
+name = "block-transition-testnet"
+path = "src/bin/block_transition_testnet.rs"
+
 
 [[bin]]
 name = "manual-claim"

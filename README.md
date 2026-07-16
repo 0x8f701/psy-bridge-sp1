@@ -64,7 +64,7 @@ cargo build --release -p psy-bridge-sp1-script --bin gen-proof
 sp1_build::build_program_with_args("../program", Default::default());
 ```
 
-生成并嵌入的 guest ELF 是 `block-transition`。host binary 位于：
+生成并嵌入的 guest ELF 是 regtest `block-transition` 与 testnet `block-transition-testnet`。host 通过 `--network regtest|testnet` 选择同一编译期嵌入 ELF；默认仍为 regtest。host binary 位于：
 
 ```text
 target/release/gen-proof
@@ -129,10 +129,11 @@ cargo run --release -p psy-bridge-sp1-script --bin gen-proof -- \
 只需从当前 release ELF 导出 program VK 时，可运行：
 
 ```bash
-cargo run --release -p psy-bridge-sp1-script --bin gen-proof -- --vkey-only
+cargo run --release -p psy-bridge-sp1-script --bin gen-proof -- --network regtest --vkey-only
+cargo run --release -p psy-bridge-sp1-script --bin gen-proof -- --network testnet --vkey-only
 ```
 
-该模式输出 `block_elf_path` 与 `vkey_hash`，不生成 proof artifact。
+该模式输出 `network`、`block_elf_path`、`block_elf_sha256` 与 `vkey_hash`，不生成 proof artifact。
 
 ### 固定输出
 
@@ -145,13 +146,14 @@ cargo run --release -p psy-bridge-sp1-script --bin gen-proof -- --vkey-only
 
 stdout 还输出 `proof_path`、`proof_size`、完整 proof hex、public-values path/size/hex 和 `vkey_hash`。
 
-当前 release guest 的 `--vkey-only` 输出：
+当前 authoritative DLC build 的 profile keys：
 
 ```text
-vkey_hash: 0x00a46ec348b525eea327ac89a090b17c44dab7e399a1d9fa4668c52cba1ba672
+regtest: 0x00032a98cc2c3379e6b0a87804b87d01b9b7dda16e6c635c02829bf1a931e24c
+testnet: 0x0007e438ca85c9ac7d1465df380f32fc37be58471a0c77a5c3fde317a108eb97
 ```
 
-Solana `doge-bridge` 的 non-mock `SINGLE_BLOCK_UPDATE_VK` 必须与该值逐字节相同；`BLOCK_REORG_VK` 当前别名到相同 key。Guest source、linked guest dependencies、SP1 toolchain 或 build configuration 变化后必须重新导出并核对，不能复用旧样本。
+Solana `doge-bridge` 的 profile-specific block VK 必须与所选 guest 逐字节相同。Guest source、linked guest dependencies、SP1 toolchain 或 build configuration 变化后必须重新导出并核对，不能复用旧样本。
 
 ## Withdrawal lifecycle
 
@@ -259,7 +261,7 @@ psy-doge-solana-bridge/programs/doge-bridge/src/processor.rs
 
 - 代码和本地 E2E 未经生产审计，不应直接用于真实资产。
 - block guest 在 zkVM 内执行 helper 的 block/witness transition verification，并把验证结果锚定到 Solana header 的共识字段；pending-mint/TXO-buffer commitments 仍依赖链上 buffer checks。
-- 当前 guest 使用 `DogeRegTestConfig`，因此这个 release ELF/VK 仅适用于相同网络规则的 regtest pipeline；支持其他 Dogecoin network 必须使用相应 config 重建 guest、VK、proof 与 bridge deployment。
+- `block-transition` 使用 `DogeRegTestConfig`，`block-transition-testnet` 使用 `DogeTestNetConfig`；proof、VK、bridge deployment 与 IBC `--network` 必须选择同一 profile。
 - Withdrawal 的安全性来自链上 authorize 约束、Wormhole VAA、Manager quorum、Dogecoin confirmation 和 permissionless finalize，而非 ZK。
 
 跨仓库完整流程与 E2E 证据由 `solana-doge-ibc/integration/e2e/` 维护；生产操作命令位于 `psy-doge-solana-cli/doge/`。

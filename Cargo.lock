@@ -2897,6 +2897,8 @@ dependencies = [
  "hex",
  "psy-bridge-sp1-lib",
  "psy-doge-bridge-helper",
+ "serde",
+ "serde_json",
  "sp1-build",
  "sp1-sdk",
  "tokio",
