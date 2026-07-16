@@ -1,0 +1,24 @@
+[package]
+name = "psy-bridge-sp1-program"
+version.workspace = true
+edition.workspace = true
+autobins = false
+
+[[bin]]
+name = "block-transition"
+path = "src/bin/block_transition.rs"
+
+
+[[bin]]
+name = "manual-claim"
+path = "src/bin/manual_claim.rs"
+
+[[bin]]
+name = "custodian-transition"
+path = "src/bin/custodian_transition.rs"
+
+[dependencies]
+psy-bridge-sp1-lib = { path = "../lib" }
+sp1-zkvm.workspace = true
+doge-light-client = { path = "../../dlc-lib/doge-light-client-workspace/doge-light-client", default-features = false, features = ["sp1", "serialize_bytemuck", "serialize_borsh"] }
+psy-doge-bridge-helper = { path = "../../dlc-lib/doge-light-client-workspace/psy-doge-bridge-helper", default-features = false, features = ["sha2", "serialize_bytemuck", "serialize_borsh", "serialize_speedy"] }

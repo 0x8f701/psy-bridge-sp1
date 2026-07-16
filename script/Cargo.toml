@@ -1,0 +1,21 @@
+[package]
+name = "psy-bridge-sp1-script"
+version.workspace = true
+edition.workspace = true
+autobins = false
+
+[[bin]]
+name = "gen-proof"
+path = "src/bin/gen_proof.rs"
+
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+hex = "0.4.3"
+psy-bridge-sp1-lib = { path = "../lib" }
+psy-doge-bridge-helper = { path = "../../dlc-lib/doge-light-client-workspace/psy-doge-bridge-helper", default-features = false, features = ["sha2", "serialize_borsh", "serialize_bytemuck", "serialize_speedy"] }
+sp1-sdk = { version = "6.3.1", features = ["cuda"] }
+tokio = { version = "1.52", features = ["rt-multi-thread"] }
+
+[build-dependencies]
+sp1-build = "6.3.1"
