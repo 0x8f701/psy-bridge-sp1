@@ -353,15 +353,46 @@ async fn generate_proof(
     })
 }
 
+#[cfg(unix)]
+fn duplicate_protocol_stdout() -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let stdout = std::io::stdout();
+    let protocol_fd = unsafe { dup_for_protocol(stdout.as_raw_fd()) };
+    if protocol_fd == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stderr = std::io::stderr();
+    if unsafe { dup2_for_child_process(stderr.as_raw_fd(), stdout.as_raw_fd()) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(protocol_fd) })
+}
+
+#[cfg(not(unix))]
+fn duplicate_protocol_stdout() -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "daemon protocol stdout isolation requires Unix",
+    ))
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    #[link_name = "dup"]
+    fn dup_for_protocol(fd: i32) -> i32;
+    #[link_name = "dup2"]
+    fn dup2_for_child_process(oldfd: i32, newfd: i32) -> i32;
+}
+
 async fn run_daemon(program: BlockProgram) -> Result<(), Box<dyn Error>> {
+    let mut protocol_stdout = duplicate_protocol_stdout()?;
     let client = ProverClient::builder().cuda().build().await;
     let proving_key = client.setup(program.elf.clone()).await?;
     let elf_sha256 = hex::encode(sha256(&program.elf));
     let vkey_hash = proving_key.verifying_key().bytes32();
-    let stdout = std::io::stdout();
-    let mut stdout = stdout.lock();
     serde_json::to_writer(
-        &mut stdout,
+        &mut protocol_stdout,
         &IdentityResponse {
             kind: "identity",
             network: program.network.as_str(),
@@ -370,8 +401,8 @@ async fn run_daemon(program: BlockProgram) -> Result<(), Box<dyn Error>> {
             vkey_hash: vkey_hash.clone(),
         },
     )?;
-    stdout.write_all(b"\n")?;
-    stdout.flush()?;
+    protocol_stdout.write_all(b"\n")?;
+    protocol_stdout.flush()?;
 
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
@@ -383,7 +414,7 @@ async fn run_daemon(program: BlockProgram) -> Result<(), Box<dyn Error>> {
             Ok(request) => request,
             Err(error) => {
                 serde_json::to_writer(
-                    &mut stdout,
+                    &mut protocol_stdout,
                     &ErrorResponse {
                         kind: "proof",
                         request_id: None,
@@ -391,8 +422,8 @@ async fn run_daemon(program: BlockProgram) -> Result<(), Box<dyn Error>> {
                         error: format!("invalid request JSON: {error}"),
                     },
                 )?;
-                stdout.write_all(b"\n")?;
-                stdout.flush()?;
+                protocol_stdout.write_all(b"\n")?;
+                protocol_stdout.flush()?;
                 continue;
             }
         };
@@ -403,7 +434,7 @@ async fn run_daemon(program: BlockProgram) -> Result<(), Box<dyn Error>> {
         };
         match proof_result {
             Ok(artifacts) => serde_json::to_writer(
-                &mut stdout,
+                &mut protocol_stdout,
                 &ProofResponse {
                     kind: "proof",
                     request_id: &request_id,
@@ -421,7 +452,7 @@ async fn run_daemon(program: BlockProgram) -> Result<(), Box<dyn Error>> {
                 },
             )?,
             Err(error) => serde_json::to_writer(
-                &mut stdout,
+                &mut protocol_stdout,
                 &ErrorResponse {
                     kind: "proof",
                     request_id: Some(&request_id),
@@ -430,8 +461,8 @@ async fn run_daemon(program: BlockProgram) -> Result<(), Box<dyn Error>> {
                 },
             )?,
         }
-        stdout.write_all(b"\n")?;
-        stdout.flush()?;
+        protocol_stdout.write_all(b"\n")?;
+        protocol_stdout.flush()?;
     }
     Ok(())
 }
