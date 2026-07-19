@@ -2,13 +2,12 @@
 
 `psy-bridge-sp1` 是 `psy-doge-solana-bridge` 当前真实 block-transition 证明路径使用的 **SP1 v6.3.1** workspace。
 
-唯一运行时证明 guest 是 `block-transition`：它验证序列化的 Dogecoin bridge state 与 block witness，使用 manager custody script config、确认数和 deposit fee 参数执行 block transition，并把验证后的状态与旧/新 Solana `PsyBridgeHeader` 的共识字段绑定。对应的 `gen-proof` host 使用 `ProverClient::builder().cpu()`，生成 Groth16 proof 后立即通过 SP1 SDK `client.verify(...)` 自验证；它不是网络服务，也不监听端口。
+唯一运行时证明 guest 是 `block-transition`：它验证序列化的 Dogecoin bridge state 与 block witness，使用 manager custody script config、确认数和 deposit fee 参数执行 block transition，并把验证后的状态与旧/新 Solana `PsyBridgeHeader` 的共识字段绑定。对应的 `gen-proof` host 使用 `ProverClient::builder().cuda()`，生成 Groth16 proof 后立即通过 SP1 SDK `client.verify(...)` 自验证；普通模式是一次性进程，`--daemon` 模式通过 stdin/stdout JSON lines 复用同一 CUDA prover，不监听网络端口。
 
-Withdrawal 不使用 ZK：bridge 在链上原子授权输出并发出 Wormhole VAA，Manager 达到 5-of-7 quorum 后签名并广播 Dogecoin 交易，确认后由任何人提交 finalize。
+Withdrawal 不使用 ZK：`request_withdrawal` burn 后，operator 提交 bounded `snapshot_withdrawals`，范围 multiproof 将请求严格绑定到 outputs-only UTX0；Wormhole VAA 和 Manager 5-of-7 signatures 授权 Dogecoin broadcast，Electrs 确认后由 operator 在 OperatorStore 中原子记录 `Confirmed`/`Spent`。
 
 > 该 workspace 证明 block witness 对给定旧状态的转换，以及该结果与提交到 Solana 的 header/config/custodian commitment 一致。它不自行运行 Dogecoin 节点、Solana validator 或 Wormhole Guardian。
 
-> 新增或修改 guest、生成 program VK、接入 non-mock Solana verifier 的完整流程见 [`DEVELOPING_CIRCUITS.md`](./DEVELOPING_CIRCUITS.md)。
 
 ## Workspace 结构
 
@@ -17,7 +16,7 @@ lib/                                      共享 SHA-256/public-input 公式
 program/src/bin/block_transition.rs       mandatory block-update proof guest
 program/src/bin/manual_claim.rs           retained manual-claim guest（无本仓库 runtime host）
 program/src/bin/custodian_transition.rs   retained custodian-transition guest（无本仓库 runtime host）
-script/src/bin/gen_proof.rs               block-transition CPU prover CLI
+script/src/bin/gen_proof.rs               block-transition CUDA prover CLI/stdio daemon
 script/build.rs                           用 sp1-build 编译 program package guest ELF
 ```
 
@@ -46,7 +45,7 @@ script/build.rs                           用 sp1-build 编译 program package g
    sudo apt-get install protobuf-compiler
    ```
 
-5. **本机资源**：当前 CLI 强制使用 CPU prover。Groth16 proving 是高 CPU/内存、明显长于普通 Rust build 的作业；不要用短的通用命令 timeout 判断失败。首次运行还会编译 guest/host 依赖。
+5. **本机资源**：当前 CLI 强制使用 CUDA prover，需要可用的 NVIDIA GPU、驱动和 SP1 CUDA runtime。Groth16 proving 是高 GPU/显存负载、明显长于普通 Rust build 的作业；不要用短的通用命令 timeout 判断失败。首次运行还会编译 guest/host 依赖。
 
 快速检查：
 
@@ -146,20 +145,20 @@ cargo run --release -p psy-bridge-sp1-script --bin gen-proof -- --network testne
 
 stdout 还输出 `proof_path`、`proof_size`、完整 proof hex、public-values path/size/hex 和 `vkey_hash`。
 
-当前 authoritative DLC build 的 profile keys：
+当前 build 的 profile keys：
 
 ```text
-regtest: 0x00032a98cc2c3379e6b0a87804b87d01b9b7dda16e6c635c02829bf1a931e24c
-testnet: 0x0007e438ca85c9ac7d1465df380f32fc37be58471a0c77a5c3fde317a108eb97
+regtest: 0x002ed3c169b6415db45e569dd01675bfb2ba89c59c7d26582f3a22d2ec313ee8
+testnet: 0x006e4245bbde933878efc6f5d9673e0361a2c19872291b05f3c78361b98d35fd
 ```
 
-Solana `doge-bridge` 的 profile-specific block VK 必须与所选 guest 逐字节相同。Guest source、linked guest dependencies、SP1 toolchain 或 build configuration 变化后必须重新导出并核对，不能复用旧样本。
+Solana `doge-bridge` 的 profile-specific block VK 必须与所选 guest 逐字节相同。以对应 profile 的 `gen-proof --daemon` identity JSON 为当前 build 的权威输出；Guest source、linked guest dependencies、SP1 toolchain 或 build configuration 变化后必须重新导出并同步 bridge/IBC/CLI 常量，不能复用旧样本。
 
 ## Withdrawal lifecycle
 
-Withdrawal proof guest、host binary、public-input ABI 和 verification key 已删除。Withdrawal 的授权语义由 Solana instruction 直接验证：请求 membership 与输出严格 1:1/order、最多一个 canonical change output；随后通过 Wormhole VAA 和 5-of-7 Manager signatures 授权 Dogecoin broadcast，并在确认后用 discriminator 17 permissionlessly finalize。
+Withdrawal proof guest、host binary、public-input ABI 和 verification key 已删除。当前 withdrawal 授权由 Solana instruction 直接验证：`request_withdrawal` burn 后由 operator 调用 bounded `snapshot_withdrawals`，范围 multiproof 将请求叶严格绑定到 outputs-only UTX0 payload；Wormhole VAA 传递该 payload，5-of-7 Manager signatures 授权 Dogecoin broadcast，Electrs 确认后由 operator 在 OperatorStore 中原子落账为 `Confirmed`/`Spent`。
 
-因此 withdrawal 不产生 SP1 proof/public-values artifact，也没有 withdrawal VK 或 prover runtime dependency。
+因此 withdrawal 不产生 SP1 proof/public-values artifact，也没有 withdrawal VK、guest 或 prover runtime dependency；`block_update` 是唯一 ZK 路径。
 
 ## 356-byte proof ABI
 
@@ -191,20 +190,20 @@ Withdrawal proof guest、host binary、public-input ABI 和 verification key 已
 
 这建立了 SP1 SDK 层的本机验证。链上兼容性还需要 non-`mock-zkp` 的 `psy-doge-solana-bridge` 使用 block-transition key 验证完整 356-byte proof。Withdrawal lifecycle 不进入 SP1 verifier。
 
-## CPU proof 预期
+## CUDA proof 预期
 
-- prover 被硬编码为 `.cpu()`；当前没有 CLI flag 切换网络 prover/GPU。
-- 首次运行包含大量依赖和 guest ELF build，后续缓存命中后 host 启动更快，但 Groth16 proving 本身仍是重 CPU 作业。
-- CPU 时间依赖硬件、系统负载和缓存，不应把某台机器的秒数写成保证值。
+- prover 被硬编码为 `.cuda()`；当前没有 CLI flag 切换 CPU 或网络 prover。
+- 首次运行包含大量依赖和 guest ELF build；后续缓存命中后 host 启动更快，`--daemon` 还能复用已加载的 proving key/CUDA runtime。
+- GPU 时间依赖硬件、驱动、系统负载和缓存，不应把某台机器的秒数写成保证值。
 - 自动化应给 proof job 独立长 timeout，并同时监控进程退出状态和输出文件长度。
-- 对 block CLI，应在运行前删除/隔离固定 `/tmp` 旧文件，因为成功会覆盖固定路径；E2E 测试已经在启动 prover 前删除 stale outputs。
+- 对 block CLI，应在运行前删除/隔离固定 `/tmp` 旧文件，因为成功会覆盖固定路径；本地 smoke 已在启动 prover 前删除 stale outputs。
 
 ## 与桥集成
 
-当前 real E2E 从 bridge/CLI block pipeline 调用：
+当前真实本地 smoke / IBC block pipeline 直接执行预构建的 prover：
 
 ```bash
-cargo run --release -p psy-bridge-sp1-script --bin gen-proof -- ...
+psy-bridge-sp1/target/release/gen-proof ...
 ```
 
 桥侧 VK 定义位于：
@@ -259,9 +258,9 @@ psy-doge-solana-bridge/programs/doge-bridge/src/processor.rs
 
 ## 安全范围
 
-- 代码和本地 E2E 未经生产审计，不应直接用于真实资产。
+- 代码和本地 smoke 未经生产审计，不应直接用于真实资产。
 - block guest 在 zkVM 内执行 helper 的 block/witness transition verification，并把验证结果锚定到 Solana header 的共识字段；pending-mint/TXO-buffer commitments 仍依赖链上 buffer checks。
 - `block-transition` 使用 `DogeRegTestConfig`，`block-transition-testnet` 使用 `DogeTestNetConfig`；proof、VK、bridge deployment 与 IBC `--network` 必须选择同一 profile。
-- Withdrawal 的安全性来自链上 authorize 约束、Wormhole VAA、Manager quorum、Dogecoin confirmation 和 permissionless finalize，而非 ZK。
+- Withdrawal 的安全性来自链上 request/snapshot 约束与范围 multiproof、Wormhole VAA、Manager quorum、Dogecoin confirmation，以及 OperatorStore 的原子状态转换，而非 ZK。
 
-跨仓库完整流程与 E2E 证据由 `solana-doge-ibc/integration/e2e/` 维护；生产操作命令位于 `psy-doge-solana-cli/doge/`。
+跨仓库完整本地验证由 `psy-doge-solana-cli` 维护，唯一公开入口为 `doge-solana-cli --network localhost local-e2e`；`tools/local/runner.ts` 仅是其内部实现。生产/devnet 操作命令使用同一二进制的 `--network devnet`，且不启动任何本地进程；部署为独立的 `tools/deploy/devnet.ts --network devnet`。
