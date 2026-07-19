@@ -148,8 +148,15 @@ stdout 还输出 `proof_path`、`proof_size`、完整 proof hex、public-values 
 当前 build 的 profile keys：
 
 ```text
-regtest: 0x002ed3c169b6415db45e569dd01675bfb2ba89c59c7d26582f3a22d2ec313ee8
-testnet: 0x006e4245bbde933878efc6f5d9673e0361a2c19872291b05f3c78361b98d35fd
+regtest: 0x001fa018c35d88136afe0e92bc9afe33ba94ca5dcd9156147adf004c7810e199
+testnet: 0x00b25e2fe5866751a38e5ca4d975b30b4187f3e0528a06dc86edc6e9a8b9cc02
+```
+
+Guest ELF SHA-256：
+
+```text
+regtest: 1b15633001f56bf053bf868678218531db2ed56ddea6ee59be08df66b87a2558
+testnet: 361fb47df3dce2fc27b844ee89e79ebbcb51c82ad717d6b7518df15910fb4b25
 ```
 
 Solana `doge-bridge` 的 profile-specific block VK 必须与所选 guest 逐字节相同。以对应 profile 的 `gen-proof --daemon` identity JSON 为当前 build 的权威输出；Guest source、linked guest dependencies、SP1 toolchain 或 build configuration 变化后必须重新导出并同步 bridge/IBC/CLI 常量，不能复用旧样本。

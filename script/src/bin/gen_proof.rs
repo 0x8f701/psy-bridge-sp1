@@ -1,6 +1,8 @@
 use clap::{Parser, ValueEnum};
 use psy_bridge_sp1_lib::{block_transition_public_inputs, sha256, HASH_SIZE};
-use psy_doge_bridge_helper::tx_template::CustodyScriptConfig;
+use psy_doge_bridge_helper::tx_template::{
+    CustodyScriptConfig, LocalRegtestManagerCustody, OfficialTestnetManagerCustody,
+};
 use serde::{Deserialize, Serialize};
 use sp1_sdk::{
     include_elf, CudaProver, HashableKey, ProveRequest, Prover, ProverClient, ProvingKey,
@@ -34,6 +36,16 @@ impl Network {
         match self {
             Self::Regtest => "regtest",
             Self::Testnet => "testnet",
+        }
+    }
+
+    fn custodian_hash(
+        self,
+        custody_script_config: &CustodyScriptConfig,
+    ) -> [u8; HASH_SIZE] {
+        match self {
+            Self::Regtest => custody_script_config.hash::<LocalRegtestManagerCustody>(),
+            Self::Testnet => custody_script_config.hash::<OfficialTestnetManagerCustody>(),
         }
     }
 }
@@ -298,6 +310,7 @@ fn args_into_inputs(args: Args) -> Result<BlockTransitionInputs, Box<dyn Error>>
 async fn generate_proof(
     client: &CudaProver,
     proving_key: &<CudaProver as Prover>::ProvingKey,
+    network: Network,
     inputs: BlockTransitionInputs,
 ) -> Result<ProofArtifacts, Box<dyn Error>> {
     let old_header_hash = sha256(&inputs.old_header);
@@ -308,7 +321,9 @@ async fn generate_proof(
         .as_slice()
         .try_into()
         .expect("custody script config length was checked");
-    let custodian_hash = CustodyScriptConfig::new(custody_script_config_array).hash();
+    let custodian_hash = network.custodian_hash(&CustodyScriptConfig::new(
+        custody_script_config_array,
+    ));
     let expected_public_values = block_transition_public_inputs(
         &old_header_hash,
         &new_header_hash,
@@ -429,7 +444,7 @@ async fn run_daemon(program: BlockProgram) -> Result<(), Box<dyn Error>> {
         };
         let request_id = request.request_id.clone();
         let proof_result = match request.into_inputs() {
-            Ok(inputs) => generate_proof(&client, &proving_key, inputs).await,
+            Ok(inputs) => generate_proof(&client, &proving_key, program.network, inputs).await,
             Err(error) => Err(error),
         };
         match proof_result {
@@ -491,7 +506,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     runtime.block_on(async move {
         let client = ProverClient::builder().cuda().build().await;
         let proving_key = client.setup(program.elf.clone()).await?;
-        let artifacts = generate_proof(&client, &proving_key, inputs).await?;
+        let artifacts = generate_proof(&client, &proving_key, program.network, inputs).await?;
         println!("network: {}", program.network.as_str());
         println!("block_elf_path: {}", program.path);
         println!("block_elf_sha256: {}", hex::encode(sha256(&program.elf)));
@@ -588,19 +603,22 @@ mod tests {
     }
 
     #[test]
-    fn derives_canonical_wallet_config_hash_from_script_config() {
-        let custody_script_config = [
-            0x84, 0xb2, 0x67, 0xdd, 0x47, 0x47, 0x4d, 0xd7, 0xee, 0x3b, 0x7d, 0x7f, 0xb5,
-            0xb1, 0x0d, 0x86, 0x26, 0xbf, 0x52, 0xff, 0x8d, 0x2c, 0x82, 0x13, 0x57, 0x70,
-            0xfe, 0xad, 0x3a, 0x5a, 0xb1, 0xba,
-        ];
+    fn derives_profile_specific_wallet_config_hashes_from_script_config() {
+        let custody_script_config = hex::decode(
+            "f02732708965bb9473177495e608496b0af3bdbe5bd62ec062d8cddb1824a813",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        let config = CustodyScriptConfig::new(custody_script_config);
+
         assert_eq!(
-            CustodyScriptConfig::new(custody_script_config).hash(),
-            [
-                0xaf, 0xae, 0x95, 0x79, 0xf6, 0x7e, 0xcf, 0xf7, 0x9e, 0xa3, 0x29, 0x7a, 0x58,
-                0xa4, 0xc8, 0x14, 0xa4, 0x58, 0x20, 0x20, 0xab, 0xd4, 0xe6, 0xd3, 0xf5, 0xe3,
-                0xb1, 0x9b, 0x46, 0xf1, 0xab, 0x69,
-            ]
+            hex::encode(Network::Regtest.custodian_hash(&config)),
+            "6b6c33fa023611fdd672361f9c198353580959ad34af813af69178d61ca955eb"
+        );
+        assert_eq!(
+            hex::encode(Network::Testnet.custodian_hash(&config)),
+            "2621f9ac4de46226f85b48bcf2e20c87e6bb62ff946a9b12becb8c35a4e90ab0"
         );
     }
 

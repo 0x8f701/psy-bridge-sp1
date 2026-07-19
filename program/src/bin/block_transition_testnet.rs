@@ -8,7 +8,7 @@ use psy_doge_bridge_helper::{
     block_transition::prover_guest::{
         prover_guest_run_with_bytes, prover_guest_verify_block_transition_detailed,
     },
-    tx_template::CustodyScriptConfig,
+    tx_template::{CustodyScriptConfig, OfficialTestnetManagerCustody},
 };
 
 const SOLANA_HEADER_SIZE: usize = 320;
@@ -51,7 +51,7 @@ pub fn main() {
 
     let config_params = sp1_zkvm::io::read_vec();
     assert_eq!(config_params.len(), CONFIG_PARAMS_SIZE);
-    let custodian_hash = custody_script_config.hash();
+    let custodian_hash = custody_script_config.hash::<OfficialTestnetManagerCustody>();
 
     // --- Build helper input and verify ---
     let mut helper_input = Vec::with_capacity(4 + old_state_bytes.len() + witness_bytes.len());
@@ -62,7 +62,10 @@ pub fn main() {
     let (witness, mut state) =
         prover_guest_run_with_bytes(&helper_input).expect("failed to parse witness/state");
 
-    let verified = match prover_guest_verify_block_transition_detailed::<DogeTestNetConfig>(
+    let verified = match prover_guest_verify_block_transition_detailed::<
+        DogeTestNetConfig,
+        OfficialTestnetManagerCustody,
+    >(
         custody_script_config,
         required_confirmations,
         witness,
