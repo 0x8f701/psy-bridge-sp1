@@ -5,24 +5,33 @@ use psy_doge_bridge_helper::tx_template::{
 };
 use serde::{Deserialize, Serialize};
 use sp1_sdk::{
-    include_elf, CudaProver, HashableKey, ProveRequest, Prover, ProverClient, ProvingKey,
-    SP1Stdin,
+    include_elf, CudaProver, HashableKey, ProveRequest, Prover, ProverClient, SP1Stdin,
 };
 use std::{
     error::Error,
+    fmt,
     io::{BufRead, Write},
     path::Path,
+    process,
+    time::Duration,
 };
 
 const BLOCK_TRANSITION_REGTEST_ELF: sp1_sdk::Elf = include_elf!("block-transition");
-const BLOCK_TRANSITION_REGTEST_ELF_PATH: &str = env!("SP1_ELF_block-transition");
 const BLOCK_TRANSITION_TESTNET_ELF: sp1_sdk::Elf = include_elf!("block-transition-testnet");
-const BLOCK_TRANSITION_TESTNET_ELF_PATH: &str = env!("SP1_ELF_block-transition-testnet");
+const BLOCK_TRANSITION_REGTEST_GUEST_ID: &str = "block-transition";
+const BLOCK_TRANSITION_TESTNET_GUEST_ID: &str = "block-transition-testnet";
 const HEADER_SIZE: usize = 320;
 const CUSTODY_SCRIPT_CONFIG_SIZE: usize = HASH_SIZE;
 const CONFIG_PARAMS_SIZE: usize = 48;
-const PROOF_PATH: &str = "/tmp/bridge-block-transition-proof.bin";
-const PUBLIC_VALUES_PATH: &str = "/tmp/bridge-block-transition-pubvals.bin";
+
+/// Default wall-clock budget for `client.setup(ELF)` (daemon boot or one-shot).
+const DEFAULT_SETUP_TIMEOUT_SECS: u64 = 600;
+/// Default wall-clock budget for the guest `execute` dry-run before proving.
+const DEFAULT_EXECUTE_TIMEOUT_SECS: u64 = 900;
+/// Default wall-clock budget for Groth16 `prove` on CUDA.
+const DEFAULT_PROVE_TIMEOUT_SECS: u64 = 7_200;
+/// Process exit status used after a timed-out CUDA phase so supervisors restart cleanly.
+const TIMEOUT_EXIT_CODE: i32 = 75;
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
 enum Network {
@@ -50,10 +59,11 @@ impl Network {
     }
 }
 
+/// Path-independent guest identity: stable id + embedded ELF bytes for a network.
 struct BlockProgram {
     network: Network,
     elf: sp1_sdk::Elf,
-    path: &'static str,
+    guest_id: &'static str,
 }
 
 fn block_program(network: Network) -> BlockProgram {
@@ -61,13 +71,44 @@ fn block_program(network: Network) -> BlockProgram {
         Network::Regtest => BlockProgram {
             network,
             elf: BLOCK_TRANSITION_REGTEST_ELF.clone(),
-            path: BLOCK_TRANSITION_REGTEST_ELF_PATH,
+            guest_id: BLOCK_TRANSITION_REGTEST_GUEST_ID,
         },
         Network::Testnet => BlockProgram {
             network,
             elf: BLOCK_TRANSITION_TESTNET_ELF.clone(),
-            path: BLOCK_TRANSITION_TESTNET_ELF_PATH,
+            guest_id: BLOCK_TRANSITION_TESTNET_GUEST_ID,
         },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeadlineConfig {
+    setup: Duration,
+    execute: Duration,
+    prove: Duration,
+}
+
+impl DeadlineConfig {
+    fn from_secs(setup_secs: u64, execute_secs: u64, prove_secs: u64) -> Result<Self, String> {
+        if setup_secs == 0 || execute_secs == 0 || prove_secs == 0 {
+            return Err(
+                "setup/execute/prove timeout seconds must be non-zero hard deadlines".to_owned(),
+            );
+        }
+        Ok(Self {
+            setup: Duration::from_secs(setup_secs),
+            execute: Duration::from_secs(execute_secs),
+            prove: Duration::from_secs(prove_secs),
+        })
+    }
+
+    fn default_config() -> Self {
+        Self::from_secs(
+            DEFAULT_SETUP_TIMEOUT_SECS,
+            DEFAULT_EXECUTE_TIMEOUT_SECS,
+            DEFAULT_PROVE_TIMEOUT_SECS,
+        )
+        .expect("default deadlines are non-zero")
     }
 }
 
@@ -75,7 +116,7 @@ fn block_program(network: Network) -> BlockProgram {
 #[command(about = "Generate an SP1 Groth16 block-transition proof")]
 struct Args {
     /// Dogecoin consensus profile compiled into the selected block-transition guest.
-    #[arg(long, value_enum, default_value_t)]
+    #[arg(long, value_enum)]
     network: Network,
     /// Run a line-delimited JSON request/response daemon on stdin/stdout.
     #[arg(long)]
@@ -83,6 +124,16 @@ struct Args {
     /// Derive and print the release block-transition verifying-key hash without proving.
     #[arg(long, conflicts_with = "daemon")]
     vkey_only: bool,
+
+    /// Hard wall-clock seconds for `client.setup` (daemon boot / one-shot / vkey-only).
+    #[arg(long, default_value_t = DEFAULT_SETUP_TIMEOUT_SECS)]
+    setup_timeout_secs: u64,
+    /// Hard wall-clock seconds for guest `execute` before proving.
+    #[arg(long, default_value_t = DEFAULT_EXECUTE_TIMEOUT_SECS)]
+    execute_timeout_secs: u64,
+    /// Hard wall-clock seconds for CUDA Groth16 `prove`.
+    #[arg(long, default_value_t = DEFAULT_PROVE_TIMEOUT_SECS)]
+    prove_timeout_secs: u64,
 
     /// Previous Dogecoin bridge state bytes as hex, or @path/path to a file containing hex.
     #[arg(long, required_unless_present_any = ["vkey_only", "daemon"])]
@@ -125,6 +176,16 @@ struct Args {
     config_params: Option<String>,
 }
 
+impl Args {
+    fn deadlines(&self) -> Result<DeadlineConfig, String> {
+        DeadlineConfig::from_secs(
+            self.setup_timeout_secs,
+            self.execute_timeout_secs,
+            self.prove_timeout_secs,
+        )
+    }
+}
+
 struct BlockTransitionInputs {
     old_state: Vec<u8>,
     witness: Vec<u8>,
@@ -153,11 +214,12 @@ struct DaemonRequest {
     config_params: String,
 }
 
+/// Path-independent daemon identity: network + stable guest id + ELF digest + VK.
 #[derive(Debug, Serialize)]
 struct IdentityResponse<'a> {
     kind: &'static str,
     network: &'a str,
-    block_elf_path: &'a str,
+    guest_id: &'a str,
     block_elf_sha256: String,
     vkey_hash: String,
 }
@@ -168,13 +230,11 @@ struct ProofResponse<'a> {
     request_id: &'a str,
     ok: bool,
     network: &'a str,
-    block_elf_path: &'a str,
+    guest_id: &'a str,
     block_elf_sha256: &'a str,
     vkey_hash: &'a str,
-    proof_path: &'static str,
     proof_size: usize,
     proof_bytes: String,
-    public_values_path: &'static str,
     public_values_size: usize,
     public_values: String,
 }
@@ -191,6 +251,40 @@ struct ProofArtifacts {
     proof_bytes: Vec<u8>,
     public_values: Vec<u8>,
 }
+
+#[derive(Debug)]
+enum ProofWorkError {
+    Failed(String),
+    TimedOut {
+        phase: &'static str,
+        timeout: Duration,
+    },
+}
+
+impl ProofWorkError {
+    fn failed(error: impl ToString) -> Self {
+        Self::Failed(error.to_string())
+    }
+
+    fn is_timeout(&self) -> bool {
+        matches!(self, Self::TimedOut { .. })
+    }
+}
+
+impl fmt::Display for ProofWorkError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Failed(message) => formatter.write_str(message),
+            Self::TimedOut { phase, timeout } => write!(
+                formatter,
+                "{phase} timed out after {}s; CUDA cancellation may leave GPU state unusable so this process will exit",
+                timeout.as_secs()
+            ),
+        }
+    }
+}
+
+impl Error for ProofWorkError {}
 
 impl BlockTransitionInputs {
     fn into_stdin(self) -> SP1Stdin {
@@ -307,12 +401,27 @@ fn args_into_inputs(args: Args) -> Result<BlockTransitionInputs, Box<dyn Error>>
     })
 }
 
+async fn setup_proving_key(
+    client: &CudaProver,
+    elf: sp1_sdk::Elf,
+    deadlines: DeadlineConfig,
+) -> Result<<CudaProver as Prover>::ProvingKey, ProofWorkError> {
+    tokio::time::timeout(deadlines.setup, client.setup(elf))
+        .await
+        .map_err(|_| ProofWorkError::TimedOut {
+            phase: "setup",
+            timeout: deadlines.setup,
+        })?
+        .map_err(|error| ProofWorkError::failed(format!("failed to setup proving key: {error}")))
+}
+
 async fn generate_proof(
     client: &CudaProver,
     proving_key: &<CudaProver as Prover>::ProvingKey,
     network: Network,
     inputs: BlockTransitionInputs,
-) -> Result<ProofArtifacts, Box<dyn Error>> {
+    deadlines: DeadlineConfig,
+) -> Result<ProofArtifacts, ProofWorkError> {
     let old_header_hash = sha256(&inputs.old_header);
     let new_header_hash = sha256(&inputs.new_header);
     let config_hash = sha256(&inputs.config_params);
@@ -331,41 +440,68 @@ async fn generate_proof(
         &custodian_hash,
     );
     let stdin = inputs.into_stdin();
-    let (_, execution_report) = client
-        .execute(proving_key.elf().clone(), stdin.clone())
-        .await?;
+
+    let (_, execution_report) = tokio::time::timeout(
+        deadlines.execute,
+        client.execute(proving_key.elf().clone(), stdin.clone()),
+    )
+    .await
+    .map_err(|_| ProofWorkError::TimedOut {
+        phase: "execute",
+        timeout: deadlines.execute,
+    })?
+    .map_err(|error| ProofWorkError::failed(format!("failed to execute guest: {error}")))?;
+
     if execution_report.exit_code != 0 {
-        return Err(format!(
+        return Err(ProofWorkError::failed(format!(
             "block-transition guest exited with code {}; report: {:?}",
             execution_report.exit_code, execution_report
-        )
-        .into());
+        )));
     }
 
-    let proof = client
-        .prove(proving_key, stdin)
-        .groth16()
+    let proof = tokio::time::timeout(deadlines.prove, client.prove(proving_key, stdin).groth16())
         .await
-        .map_err(|error| format!("failed to generate Groth16 proof: {error}"))?;
-    client.verify(&proof, proving_key.verifying_key(), None)?;
+        .map_err(|_| ProofWorkError::TimedOut {
+            phase: "prove",
+            timeout: deadlines.prove,
+        })?
+        .map_err(|error| ProofWorkError::failed(format!("failed to generate Groth16 proof: {error}")))?;
+
+    client
+        .verify(&proof, proving_key.verifying_key(), None)
+        .map_err(|error| ProofWorkError::failed(format!("SP1 SDK verify failed: {error}")))?;
 
     let proof_bytes = proof.bytes();
     let public_values = proof.public_values.to_vec();
     if public_values.as_slice() != expected_public_values.as_slice() {
-        return Err(format!(
+        return Err(ProofWorkError::failed(format!(
             "zkVM public values mismatch: expected {}, got {}",
             hex::encode(expected_public_values),
             hex::encode(&public_values)
-        )
-        .into());
+        )));
     }
 
-    std::fs::write(PROOF_PATH, &proof_bytes)?;
-    std::fs::write(PUBLIC_VALUES_PATH, &public_values)?;
     Ok(ProofArtifacts {
         proof_bytes,
         public_values,
     })
+}
+
+fn write_json_line(
+    protocol_stdout: &mut impl Write,
+    value: &impl Serialize,
+) -> Result<(), Box<dyn Error>> {
+    serde_json::to_writer(&mut *protocol_stdout, value)?;
+    protocol_stdout.write_all(b"\n")?;
+    protocol_stdout.flush()?;
+    Ok(())
+}
+
+fn exit_after_timeout_response() -> ! {
+    // Cancelling an in-flight CUDA future does not reliably reclaim GPU resources.
+    // Fail fast so the supervisor restarts a clean prover process instead of serving
+    // further requests from a potentially polluted daemon.
+    process::exit(TIMEOUT_EXIT_CODE);
 }
 
 #[cfg(unix)]
@@ -400,24 +536,35 @@ unsafe extern "C" {
     fn dup2_for_child_process(oldfd: i32, newfd: i32) -> i32;
 }
 
-async fn run_daemon(program: BlockProgram) -> Result<(), Box<dyn Error>> {
+async fn run_daemon(
+    program: BlockProgram,
+    deadlines: DeadlineConfig,
+) -> Result<(), Box<dyn Error>> {
     let mut protocol_stdout = duplicate_protocol_stdout()?;
     let client = ProverClient::builder().cuda().build().await;
-    let proving_key = client.setup(program.elf.clone()).await?;
+    let proving_key = match setup_proving_key(&client, program.elf.clone(), deadlines).await {
+        Ok(proving_key) => proving_key,
+        Err(error) => {
+            // No identity line yet; surface the failure on stderr and exit.
+            eprintln!("gen-proof daemon setup failed: {error}");
+            if error.is_timeout() {
+                exit_after_timeout_response();
+            }
+            return Err(error.into());
+        }
+    };
     let elf_sha256 = hex::encode(sha256(&program.elf));
     let vkey_hash = proving_key.verifying_key().bytes32();
-    serde_json::to_writer(
+    write_json_line(
         &mut protocol_stdout,
         &IdentityResponse {
             kind: "identity",
             network: program.network.as_str(),
-            block_elf_path: program.path,
+            guest_id: program.guest_id,
             block_elf_sha256: elf_sha256.clone(),
             vkey_hash: vkey_hash.clone(),
         },
     )?;
-    protocol_stdout.write_all(b"\n")?;
-    protocol_stdout.flush()?;
 
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
@@ -428,7 +575,7 @@ async fn run_daemon(program: BlockProgram) -> Result<(), Box<dyn Error>> {
         let request = match serde_json::from_str::<DaemonRequest>(&line) {
             Ok(request) => request,
             Err(error) => {
-                serde_json::to_writer(
+                write_json_line(
                     &mut protocol_stdout,
                     &ErrorResponse {
                         kind: "proof",
@@ -437,47 +584,49 @@ async fn run_daemon(program: BlockProgram) -> Result<(), Box<dyn Error>> {
                         error: format!("invalid request JSON: {error}"),
                     },
                 )?;
-                protocol_stdout.write_all(b"\n")?;
-                protocol_stdout.flush()?;
                 continue;
             }
         };
         let request_id = request.request_id.clone();
         let proof_result = match request.into_inputs() {
-            Ok(inputs) => generate_proof(&client, &proving_key, program.network, inputs).await,
-            Err(error) => Err(error),
+            Ok(inputs) => {
+                generate_proof(&client, &proving_key, program.network, inputs, deadlines).await
+            }
+            Err(error) => Err(ProofWorkError::failed(error)),
         };
         match proof_result {
-            Ok(artifacts) => serde_json::to_writer(
+            Ok(artifacts) => write_json_line(
                 &mut protocol_stdout,
                 &ProofResponse {
                     kind: "proof",
                     request_id: &request_id,
                     ok: true,
                     network: program.network.as_str(),
-                    block_elf_path: program.path,
+                    guest_id: program.guest_id,
                     block_elf_sha256: &elf_sha256,
                     vkey_hash: &vkey_hash,
-                    proof_path: PROOF_PATH,
                     proof_size: artifacts.proof_bytes.len(),
                     proof_bytes: hex::encode(&artifacts.proof_bytes),
-                    public_values_path: PUBLIC_VALUES_PATH,
                     public_values_size: artifacts.public_values.len(),
                     public_values: hex::encode(&artifacts.public_values),
                 },
             )?,
-            Err(error) => serde_json::to_writer(
-                &mut protocol_stdout,
-                &ErrorResponse {
-                    kind: "proof",
-                    request_id: Some(&request_id),
-                    ok: false,
-                    error: error.to_string(),
-                },
-            )?,
+            Err(error) => {
+                let timed_out = error.is_timeout();
+                write_json_line(
+                    &mut protocol_stdout,
+                    &ErrorResponse {
+                        kind: "proof",
+                        request_id: Some(&request_id),
+                        ok: false,
+                        error: error.to_string(),
+                    },
+                )?;
+                if timed_out {
+                    exit_after_timeout_response();
+                }
+            }
         }
-        protocol_stdout.write_all(b"\n")?;
-        protocol_stdout.flush()?;
     }
     Ok(())
 }
@@ -485,17 +634,26 @@ async fn run_daemon(program: BlockProgram) -> Result<(), Box<dyn Error>> {
 fn main() -> Result<(), Box<dyn Error>> {
     sp1_sdk::utils::setup_logger();
     let args = Args::parse();
+    let deadlines = args.deadlines().map_err(|error| -> Box<dyn Error> { error.into() })?;
     let program = block_program(args.network);
     let runtime = tokio::runtime::Runtime::new()?;
     if args.daemon {
-        return runtime.block_on(run_daemon(program));
+        return runtime.block_on(run_daemon(program, deadlines));
     }
     if args.vkey_only {
         return runtime.block_on(async move {
             let client = ProverClient::builder().cuda().build().await;
-            let proving_key = client.setup(program.elf.clone()).await?;
+            let proving_key = setup_proving_key(&client, program.elf.clone(), deadlines)
+                .await
+                .map_err(|error| -> Box<dyn Error> {
+                    if error.is_timeout() {
+                        eprintln!("{error}");
+                        exit_after_timeout_response();
+                    }
+                    error.into()
+                })?;
             println!("network: {}", program.network.as_str());
-            println!("block_elf_path: {}", program.path);
+            println!("guest_id: {}", program.guest_id);
             println!("block_elf_sha256: {}", hex::encode(sha256(&program.elf)));
             println!("vkey_hash: {}", proving_key.verifying_key().bytes32());
             Ok::<(), Box<dyn Error>>(())
@@ -505,16 +663,29 @@ fn main() -> Result<(), Box<dyn Error>> {
     let inputs = args_into_inputs(args)?;
     runtime.block_on(async move {
         let client = ProverClient::builder().cuda().build().await;
-        let proving_key = client.setup(program.elf.clone()).await?;
-        let artifacts = generate_proof(&client, &proving_key, program.network, inputs).await?;
+        let proving_key = setup_proving_key(&client, program.elf.clone(), deadlines)
+            .await
+            .map_err(|error| -> Box<dyn Error> {
+                if error.is_timeout() {
+                    eprintln!("{error}");
+                    exit_after_timeout_response();
+                }
+                error.into()
+            })?;
+        let artifacts = generate_proof(&client, &proving_key, program.network, inputs, deadlines)
+            .await
+            .map_err(|error| -> Box<dyn Error> {
+                if error.is_timeout() {
+                    eprintln!("{error}");
+                    exit_after_timeout_response();
+                }
+                error.into()
+            })?;
         println!("network: {}", program.network.as_str());
-        println!("block_elf_path: {}", program.path);
+        println!("guest_id: {}", program.guest_id);
         println!("block_elf_sha256: {}", hex::encode(sha256(&program.elf)));
-
-        println!("proof_path: {PROOF_PATH}");
         println!("proof_size: {}", artifacts.proof_bytes.len());
         println!("proof_bytes: {}", hex::encode(&artifacts.proof_bytes));
-        println!("public_values_path: {PUBLIC_VALUES_PATH}");
         println!("public_values_size: {}", artifacts.public_values.len());
         println!("public_values: {}", hex::encode(&artifacts.public_values));
         println!("vkey_hash: {}", proving_key.verifying_key().bytes32());
@@ -525,14 +696,23 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{block_program, read_hex_bytes, read_hex_input, Args, BlockTransitionInputs, Network};
+    use super::{
+        block_program, read_hex_bytes, read_hex_input, Args, BlockTransitionInputs, DeadlineConfig,
+        ErrorResponse, IdentityResponse, Network, ProofResponse, ProofWorkError,
+        BLOCK_TRANSITION_REGTEST_GUEST_ID, BLOCK_TRANSITION_TESTNET_GUEST_ID,
+        DEFAULT_EXECUTE_TIMEOUT_SECS, DEFAULT_PROVE_TIMEOUT_SECS, DEFAULT_SETUP_TIMEOUT_SECS,
+        TIMEOUT_EXIT_CODE,
+    };
     use clap::{error::ErrorKind, Parser};
     use psy_doge_bridge_helper::tx_template::CustodyScriptConfig;
+    use std::time::Duration;
 
     #[test]
     fn parses_all_guest_cli_inputs() {
         let args = Args::try_parse_from([
             "gen-proof",
+            "--network",
+            "regtest",
             "--old-state",
             "00",
             "--witness",
@@ -562,11 +742,14 @@ mod tests {
         assert_eq!(args.fee_den, Some(9));
         assert_eq!(args.custody_script_config, Some("02".repeat(32)));
         assert_eq!(args.network, Network::Regtest);
+        assert_eq!(args.setup_timeout_secs, DEFAULT_SETUP_TIMEOUT_SECS);
+        assert_eq!(args.execute_timeout_secs, DEFAULT_EXECUTE_TIMEOUT_SECS);
+        assert_eq!(args.prove_timeout_secs, DEFAULT_PROVE_TIMEOUT_SECS);
     }
 
     #[test]
     fn parses_vkey_only_without_proof_inputs() {
-        let args = Args::try_parse_from(["gen-proof", "--vkey-only"]).unwrap();
+        let args = Args::try_parse_from(["gen-proof", "--network", "regtest", "--vkey-only"]).unwrap();
         assert!(args.vkey_only);
         assert!(args.old_state.is_none());
         assert!(args.custody_script_config.is_none());
@@ -579,19 +762,22 @@ mod tests {
         assert_eq!(args.network, Network::Testnet);
         let program = block_program(args.network);
         assert_eq!(program.network, Network::Testnet);
-        assert!(program.path.ends_with("/block-transition-testnet"));
+        assert_eq!(program.guest_id, BLOCK_TRANSITION_TESTNET_GUEST_ID);
         assert!(!program.elf.is_empty());
     }
 
     #[test]
-    fn regtest_remains_the_default_guest() {
-        let args = Args::try_parse_from(["gen-proof", "--vkey-only"]).unwrap();
-        assert_eq!(args.network, Network::Regtest);
-        let program = block_program(args.network);
-        assert!(program.path.ends_with("/block-transition"));
+    fn selects_regtest_guest_identifier() {
+        let program = block_program(Network::Regtest);
+        assert_eq!(program.guest_id, BLOCK_TRANSITION_REGTEST_GUEST_ID);
         assert!(!program.elf.is_empty());
     }
 
+    #[test]
+    fn rejects_missing_network() {
+        let error = Args::try_parse_from(["gen-proof", "--vkey-only"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
 
     #[test]
     fn rejects_legacy_free_script_inputs() {
@@ -600,6 +786,137 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.kind(), ErrorKind::UnknownArgument);
         }
+    }
+
+    #[test]
+    fn parses_custom_deadline_overrides() {
+        let args = Args::try_parse_from([
+            "gen-proof",
+            "--network",
+            "regtest",
+            "--daemon",
+            "--setup-timeout-secs",
+            "11",
+            "--execute-timeout-secs",
+            "22",
+            "--prove-timeout-secs",
+            "33",
+        ])
+        .unwrap();
+        let deadlines = args.deadlines().unwrap();
+        assert_eq!(deadlines.setup, Duration::from_secs(11));
+        assert_eq!(deadlines.execute, Duration::from_secs(22));
+        assert_eq!(deadlines.prove, Duration::from_secs(33));
+    }
+
+    #[test]
+    fn rejects_zero_deadline_seconds() {
+        assert!(DeadlineConfig::from_secs(0, 1, 1).is_err());
+        assert!(DeadlineConfig::from_secs(1, 0, 1).is_err());
+        assert!(DeadlineConfig::from_secs(1, 1, 0).is_err());
+
+        let args = Args::try_parse_from([
+            "gen-proof",
+            "--network",
+            "regtest",
+            "--vkey-only",
+            "--setup-timeout-secs",
+            "0",
+        ])
+        .unwrap();
+        let error = args.deadlines().unwrap_err();
+        assert!(error.contains("non-zero"));
+    }
+
+    #[test]
+    fn default_deadlines_are_hard_positive_budgets() {
+        let deadlines = DeadlineConfig::default_config();
+        assert!(deadlines.setup > Duration::ZERO);
+        assert!(deadlines.execute > Duration::ZERO);
+        assert!(deadlines.prove > Duration::ZERO);
+        assert_eq!(deadlines.setup.as_secs(), DEFAULT_SETUP_TIMEOUT_SECS);
+        assert_eq!(deadlines.execute.as_secs(), DEFAULT_EXECUTE_TIMEOUT_SECS);
+        assert_eq!(deadlines.prove.as_secs(), DEFAULT_PROVE_TIMEOUT_SECS);
+        assert_ne!(TIMEOUT_EXIT_CODE, 0);
+    }
+
+    #[test]
+    fn timeout_errors_are_structured_and_fail_fast_flagged() {
+        let error = ProofWorkError::TimedOut {
+            phase: "prove",
+            timeout: Duration::from_secs(12),
+        };
+        let rendered = error.to_string();
+        assert!(error.is_timeout());
+        assert!(rendered.contains("prove timed out after 12s"));
+        assert!(rendered.contains("will exit"));
+
+        let failed = ProofWorkError::failed("guest boom");
+        assert!(!failed.is_timeout());
+        assert_eq!(failed.to_string(), "guest boom");
+    }
+
+    #[test]
+    fn identity_response_is_path_independent() {
+        let identity = IdentityResponse {
+            kind: "identity",
+            network: "regtest",
+            guest_id: BLOCK_TRANSITION_REGTEST_GUEST_ID,
+            block_elf_sha256: "ab".repeat(32),
+            vkey_hash: "cd".repeat(32),
+        };
+        let value = serde_json::to_value(&identity).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.get("kind").unwrap(), "identity");
+        assert_eq!(object.get("network").unwrap(), "regtest");
+        assert_eq!(
+            object.get("guest_id").unwrap(),
+            BLOCK_TRANSITION_REGTEST_GUEST_ID
+        );
+        assert!(object.contains_key("block_elf_sha256"));
+        assert!(object.contains_key("vkey_hash"));
+        assert!(!object.contains_key("block_elf_path"));
+    }
+
+    #[test]
+    fn proof_and_error_responses_serialize_timeout_contract() {
+        let proof = ProofResponse {
+            kind: "proof",
+            request_id: "req-1",
+            ok: true,
+            network: "testnet",
+            guest_id: BLOCK_TRANSITION_TESTNET_GUEST_ID,
+            block_elf_sha256: "11",
+            vkey_hash: "22",
+            proof_size: 356,
+            proof_bytes: "aa".into(),
+            public_values_size: 32,
+            public_values: "bb".into(),
+        };
+        let proof_value = serde_json::to_value(&proof).unwrap();
+        assert!(!proof_value
+            .as_object()
+            .unwrap()
+            .contains_key("block_elf_path"));
+        assert_eq!(
+            proof_value.get("guest_id").unwrap(),
+            BLOCK_TRANSITION_TESTNET_GUEST_ID
+        );
+
+        let timeout = ProofWorkError::TimedOut {
+            phase: "execute",
+            timeout: Duration::from_secs(9),
+        };
+        let error = ErrorResponse {
+            kind: "proof",
+            request_id: Some("req-2"),
+            ok: false,
+            error: timeout.to_string(),
+        };
+        let error_json = serde_json::to_string(&error).unwrap();
+        assert!(error_json.contains("\"ok\":false"));
+        assert!(error_json.contains("execute timed out after 9s"));
+        assert!(error_json.contains("req-2"));
     }
 
     #[test]
