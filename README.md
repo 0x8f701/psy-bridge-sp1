@@ -45,7 +45,7 @@ script/build.rs                           用 sp1-build 编译 program package g
    sudo apt-get install protobuf-compiler
    ```
 
-5. **本机资源**：当前 CLI 强制使用 CUDA prover，需要可用的 NVIDIA GPU、驱动和 SP1 CUDA runtime。Groth16 proving 是高 GPU/显存负载、明显长于普通 Rust build 的作业；不要用短的通用命令 timeout 判断失败。首次运行还会编译 guest/host 依赖。
+5. **本机资源**：当前 CLI 强制使用 CUDA prover，需要可用的 NVIDIA GPU、驱动和 SP1 CUDA runtime。Groth16 proving 是高 GPU/显存负载、明显长于普通 Rust build 的作业。`gen-proof` 对 setup/execute/prove 使用硬 deadline（可用 CLI flag 覆盖）；超时后进程会写出结构化错误并以非零状态退出，而不是在同一可能已污染的 GPU 进程里继续接单。首次运行还会编译 guest/host 依赖。
 
 快速检查：
 
@@ -63,7 +63,7 @@ cargo build --release -p psy-bridge-sp1-script --bin gen-proof
 sp1_build::build_program_with_args("../program", Default::default());
 ```
 
-生成并嵌入的 guest ELF 是 regtest `block-transition` 与 testnet `block-transition-testnet`。host 通过 `--network regtest|testnet` 选择同一编译期嵌入 ELF；默认仍为 regtest。host binary 位于：
+生成并嵌入的 guest ELF 是 regtest `block-transition` 与 testnet `block-transition-testnet`。host 必须通过 `--network regtest|testnet` 显式选择同一编译期嵌入 ELF。host binary 位于：
 
 ```text
 target/release/gen-proof
@@ -105,14 +105,34 @@ transition_hash = SHA256(old_header_hash || new_header_hash)
 public_value    = SHA256(transition_hash || config_hash || custodian_hash)
 ```
 
-提交值为 32 bytes。Host 独立计算同一公式，要求 `proof.public_values` 完全相等，然后才写文件。
+提交值为 32 bytes。Host 独立计算同一公式，要求 `proof.public_values` 完全相等，然后才把 proof/public values 写到 stdout（或 daemon JSON 响应）。
 
 ### 实际 CLI
+
+`--network` 是所有 `gen-proof` 调用的必填参数。
 
 完整 proof invocation：
 
 ```bash
 cargo run --release -p psy-bridge-sp1-script --bin gen-proof -- \
+  --network regtest \
+  --old-state <hex-or-@file> \
+  --witness <hex-or-@file> \
+  --custody-script-config <32-byte-hex-or-@file> \
+  --required-confirmations <u32> \
+  --flat-fee <u64> \
+  --fee-num <u64> \
+  --fee-den <u64> \
+  --old-header <320-byte-hex-or-@file> \
+  --new-header <320-byte-hex-or-@file> \
+  --config-params <48-byte-hex-or-@file>
+```
+
+testnet guest：
+
+```bash
+cargo run --release -p psy-bridge-sp1-script --bin gen-proof -- \
+  --network testnet \
   --old-state <hex-or-@file> \
   --witness <hex-or-@file> \
   --custody-script-config <32-byte-hex-or-@file> \
@@ -132,34 +152,76 @@ cargo run --release -p psy-bridge-sp1-script --bin gen-proof -- --network regtes
 cargo run --release -p psy-bridge-sp1-script --bin gen-proof -- --network testnet --vkey-only
 ```
 
-该模式输出 `network`、`block_elf_path`、`block_elf_sha256` 与 `vkey_hash`，不生成 proof artifact。
+该模式输出 `network`、`guest_id`、`block_elf_sha256` 与 `vkey_hash`，不生成 proof artifact。
 
-### 固定输出
+stdio daemon：
 
-此 CLI 当前没有 `--output-dir`；每次成功都会覆盖：
-
-| 文件                                       |  期望长度 | 内容                                        |
-| ------------------------------------------ | --------: | ------------------------------------------- |
-| `/tmp/bridge-block-transition-proof.bin`   | 356 bytes | SP1 v6 Groth16 verifier input/proof bytes。 |
-| `/tmp/bridge-block-transition-pubvals.bin` |  32 bytes | 上述 `public_value`。                       |
-
-stdout 还输出 `proof_path`、`proof_size`、完整 proof hex、public-values path/size/hex 和 `vkey_hash`。
-
-当前 build 的 profile keys：
-
-```text
-regtest: 0x001fa018c35d88136afe0e92bc9afe33ba94ca5dcd9156147adf004c7810e199
-testnet: 0x00b25e2fe5866751a38e5ca4d975b30b4187f3e0528a06dc86edc6e9a8b9cc02
+```bash
+cargo run --release -p psy-bridge-sp1-script --bin gen-proof -- \
+  --network regtest \
+  --daemon
 ```
 
-Guest ELF SHA-256：
+可选 deadline 覆盖（秒，必须非零）：
 
-```text
-regtest: 1b15633001f56bf053bf868678218531db2ed56ddea6ee59be08df66b87a2558
-testnet: 361fb47df3dce2fc27b844ee89e79ebbcb51c82ad717d6b7518df15910fb4b25
+```bash
+--setup-timeout-secs <u64>     # 默认 600
+--execute-timeout-secs <u64>   # 默认 900
+--prove-timeout-secs <u64>     # 默认 7200
 ```
 
-Solana `doge-bridge` 的 profile-specific block VK 必须与所选 guest 逐字节相同。以对应 profile 的 `gen-proof --daemon` identity JSON 为当前 build 的权威输出；Guest source、linked guest dependencies、SP1 toolchain 或 build configuration 变化后必须重新导出并同步 bridge/IBC/CLI 常量，不能复用旧样本。
+### Proof 执行顺序
+
+`gen-proof` 对每次证明按固定顺序执行：
+
+1. **setup** — `client.setup(ELF)` 生成 proving/verifying key（daemon 启动时一次；one-shot/`--vkey-only` 每次进程内一次）；
+2. **execute** — `client.execute(ELF, stdin)` dry-run guest，要求 exit code 0；
+3. **prove** — `client.prove(...).groth16().await` 生成完整 356-byte Groth16 proof；
+4. **verify** — `client.verify(&proof, verifying_key, None)` 做 SP1 SDK 自验证；
+5. **public-values compare** — host 独立计算 public-value 公式，要求与 `proof.public_values` 逐字节相等；
+6. **stdout / JSON** — 成功后才输出：
+   - one-shot：`network`、`guest_id`、`block_elf_sha256`、`proof_size`、完整 `proof_bytes` hex、`public_values_size`、完整 `public_values` hex、`vkey_hash`；
+   - daemon：每个成功响应 JSON 携带同样字段（加 `request_id` / `ok: true`）。
+
+不写共享 `/tmp` artifact，因此并行的 host/daemon 进程不会互相覆盖结果。调用方应直接消费 stdout/JSON 中的 proof 与 public values 字节。
+
+### Daemon identity 与 deadline 语义
+
+Daemon 启动成功后先写一行 path-independent identity JSON，再读 stdin 请求：
+
+```json
+{
+  "kind": "identity",
+  "network": "regtest",
+  "guest_id": "block-transition",
+  "block_elf_sha256": "<64-hex>",
+  "vkey_hash": "<0x-or-hex VK>"
+}
+```
+
+Identity / proof 契约字段：
+
+| 字段 | 含义 |
+| ---- | ---- |
+| `network` | 显式 `--network`：`regtest` 或 `testnet` |
+| `guest_id` | 稳定 guest 标识：`block-transition` / `block-transition-testnet`（不依赖构建机绝对路径） |
+| `block_elf_sha256` | 嵌入 guest ELF 的 SHA-256 |
+| `vkey_hash` | SP1 program verifying key hash |
+
+**跨仓接口调整（IBC 仍期望 path）**：当前 IBC `ProverIdentityResponse` / `validate_prover_elf` 仍反序列化并 canonicalize `block_elf_path`，与配置的 `SP1_BLOCK_ELF_PATH` 做路径相等比较。本仓 identity 已改为 path-independent（`guest_id` + ELF SHA-256 + VK + network），**不再输出 `block_elf_path`**。IBC 仓需要改为：
+
+1. 接受/要求 `guest_id`（或至少不再 require `block_elf_path`）；
+2. 用 `block_elf_sha256`（以及 `network` / `vkey_hash`）校验嵌入 guest，而不是比较构建产物绝对路径；
+3. 可选保留本地 `SP1_BLOCK_ELF_PATH` 仅作 operator 侧证据归档，不再作为 daemon 握手硬条件。
+
+本批 **不修改 IBC 仓**；在 IBC 完成上述适配前，直接对接本仓新 identity 的 pipeline 会在 identity 校验处失败。
+
+Deadline / timeout 行为：
+
+- setup（daemon 启动）、单请求 execute、单请求 prove 各自有硬 wall-clock deadline；
+- 超时后 daemon/one-shot 先写出结构化 error（daemon：`{"kind":"proof","ok":false,"request_id":...,"error":"... timed out ..."}`），然后 **进程以 exit code 75 退出**；
+- 设计意图是 fail-fast：取消 in-flight CUDA future 不能可靠释放底层 GPU 资源，因此超时后不在同一进程继续服务后续请求，由 supervisor 拉起干净进程。
+- 非 timeout 的输入/guest/证明错误返回结构化 `ok: false` 后继续读下一行请求（daemon），不会永久卡在 Pending。
 
 ## Withdrawal lifecycle
 
@@ -187,30 +249,22 @@ Withdrawal proof guest、host binary、public-input ABI 和 verification key 已
 
 ## SDK verification 与链上验证
 
-`gen-proof` 执行以下顺序：
-
-1. `client.setup(ELF)` 生成 proving/verifying key；
-2. `client.prove(...).groth16().await`；
-3. 从 proof 取出 public values，并与 host 独立公式比较；
-4. `client.verify(&proof, verifying_key, None)`；
-5. 验证成功后才写输出。
-
-这建立了 SP1 SDK 层的本机验证。链上兼容性还需要 non-`mock-zkp` 的 `psy-doge-solana-bridge` 使用 block-transition key 验证完整 356-byte proof。Withdrawal lifecycle 不进入 SP1 verifier。
+顺序见上文 **Proof 执行顺序**。这建立了 SP1 SDK 层的本机验证。链上兼容性还需要 non-`mock-zkp` 的 `psy-doge-solana-bridge` 使用 block-transition key 验证完整 356-byte proof。Withdrawal lifecycle 不进入 SP1 verifier。
 
 ## CUDA proof 预期
 
 - prover 被硬编码为 `.cuda()`；当前没有 CLI flag 切换 CPU 或网络 prover。
 - 首次运行包含大量依赖和 guest ELF build；后续缓存命中后 host 启动更快，`--daemon` 还能复用已加载的 proving key/CUDA runtime。
 - GPU 时间依赖硬件、驱动、系统负载和缓存，不应把某台机器的秒数写成保证值。
-- 自动化应给 proof job 独立长 timeout，并同时监控进程退出状态和输出文件长度。
-- 对 block CLI，应在运行前删除/隔离固定 `/tmp` 旧文件，因为成功会覆盖固定路径；本地 smoke 已在启动 prover 前删除 stale outputs。
+- 自动化应给 proof job 独立长 timeout（可与 `--setup-timeout-secs` / `--execute-timeout-secs` / `--prove-timeout-secs` 对齐或略宽），并监控进程退出状态与 stdout/JSON 中的 `proof_size` / `public_values_size`（期望 `356` / `32`）。
+- 不要依赖共享 `/tmp` proof 文件、mtime 或“固定路径被覆盖”来判断成功；`gen-proof` 只通过 stdout/JSON 交付结果。
 
 ## 与桥集成
 
 当前真实本地 smoke / IBC block pipeline 直接执行预构建的 prover：
 
 ```bash
-psy-bridge-sp1/target/release/gen-proof ...
+psy-bridge-sp1/target/release/gen-proof --network <regtest|testnet> ...
 ```
 
 桥侧 VK 定义位于：
@@ -247,11 +301,12 @@ psy-doge-solana-bridge/programs/doge-bridge/src/processor.rs
 
 按顺序核对：
 
-1. CLI stdout 的 `vkey_hash`；
+1. CLI stdout / identity JSON 的 `vkey_hash`；
 2. `processor.rs` 的 `SINGLE_BLOCK_UPDATE_VK`；
 3. validator 实际部署的 `doge_bridge.so` 是否是刚构建的 non-mock ELF；
 4. proof 与 public values 是否来自同一次、同一输入运行；
-5. 是否错误复用了 SP1 v5、scrypt guest 或其他 workspace 的 proof。
+5. `guest_id` / `block_elf_sha256` / `--network` 是否与部署 profile 一致；
+6. 是否错误复用了 SP1 v5、scrypt guest 或其他 workspace 的 proof。
 
 切换 feature/VK 后必须重建并重启 validator/重新部署。`target` 中存在新文件不代表链上 program 已更新。
 
@@ -259,9 +314,13 @@ psy-doge-solana-bridge/programs/doge-bridge/src/processor.rs
 
 这是链上交易 compute budget，不是 SP1 SDK 自验证失败。提交 real Groth16 verification 时增加 Solana compute-unit limit；不要为通过测试而改用 `mock-zkp`。
 
-### 输出看似成功但文件是旧的
+### setup/execute/prove timeout 或 daemon 退出 75
 
-`gen-proof` 使用固定 `/tmp` 路径。运行前删除旧 proof/public-values，运行后要求进程 exit 0、文件 mtime 更新、长度分别为 `356/32`。
+表示对应阶段超过硬 deadline。daemon 会先返回结构化 `ok: false` error，再以 exit code 75 退出以便 supervisor 重启。不要假设取消 CUDA future 后同一进程仍可安全服务；调高 timeout flag 或排查 GPU 负载后重启 prover。
+
+### IBC identity 校验失败（缺少 `block_elf_path`）
+
+本仓已去掉 path-dependent `block_elf_path`。在 IBC 按上文跨仓契约改为 `guest_id` + ELF SHA-256 校验之前，旧 pipeline 会在 identity handshake 失败。这是预期的接口切割，不是 prover 回归。
 
 ## 安全范围
 
