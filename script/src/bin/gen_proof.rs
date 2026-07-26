@@ -118,6 +118,9 @@ struct Args {
     /// Dogecoin consensus profile compiled into the selected block-transition guest.
     #[arg(long, value_enum)]
     network: Network,
+    /// CUDA device index used by the SP1 prover.
+    #[arg(long, env = "SP1_CUDA_DEVICE_ID", default_value_t = 0)]
+    cuda_device_id: u32,
     /// Run a line-delimited JSON request/response daemon on stdin/stdout.
     #[arg(long)]
     daemon: bool,
@@ -539,9 +542,10 @@ unsafe extern "C" {
 async fn run_daemon(
     program: BlockProgram,
     deadlines: DeadlineConfig,
+    cuda_device_id: u32,
 ) -> Result<(), Box<dyn Error>> {
     let mut protocol_stdout = duplicate_protocol_stdout()?;
-    let client = ProverClient::builder().cuda().build().await;
+    let client = ProverClient::builder().cuda().with_device_id(cuda_device_id).build().await;
     let proving_key = match setup_proving_key(&client, program.elf.clone(), deadlines).await {
         Ok(proving_key) => proving_key,
         Err(error) => {
@@ -635,14 +639,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     sp1_sdk::utils::setup_logger();
     let args = Args::parse();
     let deadlines = args.deadlines().map_err(|error| -> Box<dyn Error> { error.into() })?;
+    let cuda_device_id = args.cuda_device_id;
     let program = block_program(args.network);
     let runtime = tokio::runtime::Runtime::new()?;
     if args.daemon {
-        return runtime.block_on(run_daemon(program, deadlines));
+        return runtime.block_on(run_daemon(program, deadlines, cuda_device_id));
     }
     if args.vkey_only {
         return runtime.block_on(async move {
-            let client = ProverClient::builder().cuda().build().await;
+            let client = ProverClient::builder().cuda().with_device_id(cuda_device_id).build().await;
             let proving_key = setup_proving_key(&client, program.elf.clone(), deadlines)
                 .await
                 .map_err(|error| -> Box<dyn Error> {
@@ -662,7 +667,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let inputs = args_into_inputs(args)?;
     runtime.block_on(async move {
-        let client = ProverClient::builder().cuda().build().await;
+        let client = ProverClient::builder().cuda().with_device_id(cuda_device_id).build().await;
         let proving_key = setup_proving_key(&client, program.elf.clone(), deadlines)
             .await
             .map_err(|error| -> Box<dyn Error> {
@@ -801,12 +806,15 @@ mod tests {
             "22",
             "--prove-timeout-secs",
             "33",
+            "--cuda-device-id",
+            "7",
         ])
         .unwrap();
         let deadlines = args.deadlines().unwrap();
         assert_eq!(deadlines.setup, Duration::from_secs(11));
         assert_eq!(deadlines.execute, Duration::from_secs(22));
         assert_eq!(deadlines.prove, Duration::from_secs(33));
+        assert_eq!(args.cuda_device_id, 7);
     }
 
     #[test]
@@ -991,5 +999,40 @@ mod tests {
             error.to_string(),
             "test input must decode to 2 bytes, got 1"
         );
+    }
+
+    #[test]
+    fn cli_surface_excludes_solana_sender_credential_and_mint_flags() {
+        // The gen-proof daemon is the worker's child process. It must never expose
+        // a Solana signer / sender / mint / checkpoint-authority surface: it only
+        // consumes Dogecoin block-transition inputs and emits a Groth16 proof.
+        let forbidden_flags: &[&str] = &[
+            "--solana-key",
+            "--solana-keypair",
+            "--solana-pubkey",
+            "--sender",
+            "--sender-key",
+            "--signer",
+            "--keypair",
+            "--secret-key",
+            "--private-key",
+            "--mint",
+            "--mint-authority",
+            "--checkpoint",
+            "--checkpoint-authority",
+            "--bridge-authority",
+            "--custody-key",
+            "--admin-key",
+        ];
+        for flag in forbidden_flags {
+            let argv: Vec<&str> = ["gen-proof", "--network", "regtest", "--vkey-only", flag, "value"]
+                .into_iter()
+                .collect();
+            let error = Args::try_parse_from(argv).unwrap_err();
+            assert!(
+                matches!(error.kind(), clap::error::ErrorKind::UnknownArgument),
+                "gen-proof CLI unexpectedly accepted forbidden credential flag `{flag}`"
+            );
+        }
     }
 }
