@@ -1,5 +1,6 @@
 use clap::{Parser, ValueEnum};
 use psy_bridge_sp1_lib::{block_transition_public_inputs, sha256, HASH_SIZE};
+use psy_bridge_sp1_script::proof_protocol::{DaemonErrorCode, DAEMON_PROTOCOL_VERSION};
 use psy_doge_bridge_helper::tx_template::{
     CustodyScriptConfig, LocalRegtestManagerCustody, OfficialTestnetManagerCustody,
 };
@@ -202,7 +203,7 @@ struct BlockTransitionInputs {
     config_params: Vec<u8>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct DaemonRequest {
     request_id: String,
     old_state: String,
@@ -221,6 +222,7 @@ struct DaemonRequest {
 #[derive(Debug, Serialize)]
 struct IdentityResponse<'a> {
     kind: &'static str,
+    protocol_version: u32,
     network: &'a str,
     guest_id: &'a str,
     block_elf_sha256: String,
@@ -247,6 +249,7 @@ struct ErrorResponse<'a> {
     kind: &'static str,
     request_id: Option<&'a str>,
     ok: bool,
+    code: DaemonErrorCode,
     error: String,
 }
 
@@ -257,6 +260,7 @@ struct ProofArtifacts {
 
 #[derive(Debug)]
 enum ProofWorkError {
+    InvalidInput(String),
     Failed(String),
     TimedOut {
         phase: &'static str,
@@ -272,12 +276,22 @@ impl ProofWorkError {
     fn is_timeout(&self) -> bool {
         matches!(self, Self::TimedOut { .. })
     }
+
+    fn daemon_error_code(&self) -> DaemonErrorCode {
+        match self {
+            Self::InvalidInput(_) => DaemonErrorCode::InvalidInput,
+            Self::Failed(_) => DaemonErrorCode::ProofFailure,
+            Self::TimedOut { phase: "execute", .. } => DaemonErrorCode::ExecuteTimeout,
+            Self::TimedOut { phase: "prove", .. } => DaemonErrorCode::ProveTimeout,
+            Self::TimedOut { .. } => DaemonErrorCode::ProofFailure,
+        }
+    }
 }
 
 impl fmt::Display for ProofWorkError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Failed(message) => formatter.write_str(message),
+            Self::InvalidInput(message) | Self::Failed(message) => formatter.write_str(message),
             Self::TimedOut { phase, timeout } => write!(
                 formatter,
                 "{phase} timed out after {}s; CUDA cancellation may leave GPU state unusable so this process will exit",
@@ -328,6 +342,33 @@ fn read_hex_bytes(value: &str, name: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     hex::decode(&normalized).map_err(|error| format!("invalid {name} hex: {error}").into())
 }
 
+fn decode_inline_hex_bytes(value: &str, name: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    let normalized: String = value
+        .trim()
+        .strip_prefix("0x")
+        .unwrap_or(value.trim())
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect();
+    hex::decode(&normalized).map_err(|error| format!("invalid {name} hex: {error}").into())
+}
+
+fn decode_inline_hex_input(
+    value: &str,
+    name: &str,
+    expected_len: usize,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let bytes = decode_inline_hex_bytes(value, name)?;
+    if bytes.len() != expected_len {
+        return Err(format!(
+            "{name} must decode to {expected_len} bytes, got {}",
+            bytes.len()
+        )
+        .into());
+    }
+    Ok(bytes)
+}
+
 fn read_hex_input(value: &str, name: &str, expected_len: usize) -> Result<Vec<u8>, Box<dyn Error>> {
     let bytes = read_hex_bytes(value, name)?;
     if bytes.len() != expected_len {
@@ -343,9 +384,9 @@ fn read_hex_input(value: &str, name: &str, expected_len: usize) -> Result<Vec<u8
 impl DaemonRequest {
     fn into_inputs(self) -> Result<BlockTransitionInputs, Box<dyn Error>> {
         Ok(BlockTransitionInputs {
-            old_state: read_hex_bytes(&self.old_state, "old state")?,
-            witness: read_hex_bytes(&self.witness, "witness")?,
-            custody_script_config: read_hex_input(
+            old_state: decode_inline_hex_bytes(&self.old_state, "old state")?,
+            witness: decode_inline_hex_bytes(&self.witness, "witness")?,
+            custody_script_config: decode_inline_hex_input(
                 &self.custody_script_config,
                 "custody script config",
                 CUSTODY_SCRIPT_CONFIG_SIZE,
@@ -354,9 +395,9 @@ impl DaemonRequest {
             flat_fee: self.flat_fee,
             fee_num: self.fee_num,
             fee_den: self.fee_den,
-            old_header: read_hex_input(&self.old_header, "old header", HEADER_SIZE)?,
-            new_header: read_hex_input(&self.new_header, "new header", HEADER_SIZE)?,
-            config_params: read_hex_input(
+            old_header: decode_inline_hex_input(&self.old_header, "old header", HEADER_SIZE)?,
+            new_header: decode_inline_hex_input(&self.new_header, "new header", HEADER_SIZE)?,
+            config_params: decode_inline_hex_input(
                 &self.config_params,
                 "config parameters",
                 CONFIG_PARAMS_SIZE,
@@ -563,6 +604,7 @@ async fn run_daemon(
         &mut protocol_stdout,
         &IdentityResponse {
             kind: "identity",
+            protocol_version: DAEMON_PROTOCOL_VERSION,
             network: program.network.as_str(),
             guest_id: program.guest_id,
             block_elf_sha256: elf_sha256.clone(),
@@ -585,6 +627,7 @@ async fn run_daemon(
                         kind: "proof",
                         request_id: None,
                         ok: false,
+                        code: DaemonErrorCode::InvalidRequest,
                         error: format!("invalid request JSON: {error}"),
                     },
                 )?;
@@ -596,7 +639,7 @@ async fn run_daemon(
             Ok(inputs) => {
                 generate_proof(&client, &proving_key, program.network, inputs, deadlines).await
             }
-            Err(error) => Err(ProofWorkError::failed(error)),
+            Err(error) => Err(ProofWorkError::InvalidInput(error.to_string())),
         };
         match proof_result {
             Ok(artifacts) => write_json_line(
@@ -623,6 +666,7 @@ async fn run_daemon(
                         kind: "proof",
                         request_id: Some(&request_id),
                         ok: false,
+                        code: error.daemon_error_code(),
                         error: error.to_string(),
                     },
                 )?;
@@ -702,13 +746,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        block_program, read_hex_bytes, read_hex_input, Args, BlockTransitionInputs, DeadlineConfig,
-        ErrorResponse, IdentityResponse, Network, ProofResponse, ProofWorkError,
+        block_program, read_hex_bytes, read_hex_input, Args, BlockTransitionInputs, DaemonRequest,
+        DeadlineConfig, ErrorResponse, IdentityResponse, Network, ProofResponse, ProofWorkError,
         BLOCK_TRANSITION_REGTEST_GUEST_ID, BLOCK_TRANSITION_TESTNET_GUEST_ID,
         DEFAULT_EXECUTE_TIMEOUT_SECS, DEFAULT_PROVE_TIMEOUT_SECS, DEFAULT_SETUP_TIMEOUT_SECS,
         TIMEOUT_EXIT_CODE,
     };
     use clap::{error::ErrorKind, Parser};
+    use psy_bridge_sp1_script::proof_protocol::{DaemonErrorCode, DAEMON_PROTOCOL_VERSION};
     use psy_doge_bridge_helper::tx_template::CustodyScriptConfig;
     use std::time::Duration;
 
@@ -868,6 +913,7 @@ mod tests {
     fn identity_response_is_path_independent() {
         let identity = IdentityResponse {
             kind: "identity",
+            protocol_version: DAEMON_PROTOCOL_VERSION,
             network: "regtest",
             guest_id: BLOCK_TRANSITION_REGTEST_GUEST_ID,
             block_elf_sha256: "ab".repeat(32),
@@ -876,6 +922,7 @@ mod tests {
         let value = serde_json::to_value(&identity).unwrap();
         let object = value.as_object().unwrap();
         assert_eq!(object.get("kind").unwrap(), "identity");
+        assert_eq!(object.get("protocol_version").unwrap(), DAEMON_PROTOCOL_VERSION);
         assert_eq!(object.get("network").unwrap(), "regtest");
         assert_eq!(
             object.get("guest_id").unwrap(),
@@ -919,12 +966,14 @@ mod tests {
             kind: "proof",
             request_id: Some("req-2"),
             ok: false,
+            code: timeout.daemon_error_code(),
             error: timeout.to_string(),
         };
         let error_json = serde_json::to_string(&error).unwrap();
         assert!(error_json.contains("\"ok\":false"));
         assert!(error_json.contains("execute timed out after 9s"));
         assert!(error_json.contains("req-2"));
+        assert!(error_json.contains("\"code\":\"EXECUTE_TIMEOUT\""));
     }
 
     #[test]
@@ -998,6 +1047,62 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "test input must decode to 2 bytes, got 1"
+        );
+    }
+
+    fn daemon_request(old_state: String) -> DaemonRequest {
+        DaemonRequest {
+            request_id: "req-inline".to_owned(),
+            old_state,
+            witness: "01".to_owned(),
+            custody_script_config: "02".repeat(32),
+            required_confirmations: 6,
+            flat_fee: 7,
+            fee_num: 8,
+            fee_den: 9,
+            old_header: "0a".repeat(320),
+            new_header: "0b".repeat(320),
+            config_params: "0c".repeat(48),
+        }
+    }
+
+    #[test]
+    fn daemon_inputs_never_interpret_paths() {
+        let path = std::env::temp_dir().join(format!(
+            "gen-proof-inline-only-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "00").unwrap();
+        let path_text = path.to_string_lossy().into_owned();
+
+        assert!(daemon_request(path_text.clone()).into_inputs().is_err());
+        assert!(daemon_request(format!("@{path_text}")).into_inputs().is_err());
+        assert_eq!(read_hex_bytes(&format!("@{path_text}"), "old state").unwrap(), [0]);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn proof_work_error_codes_are_stable() {
+        assert_eq!(
+            ProofWorkError::InvalidInput("bad".to_owned()).daemon_error_code(),
+            DaemonErrorCode::InvalidInput
+        );
+        assert_eq!(
+            ProofWorkError::failed("proof failed").daemon_error_code(),
+            DaemonErrorCode::ProofFailure
+        );
+        assert_eq!(
+            ProofWorkError::TimedOut {
+                phase: "prove",
+                timeout: Duration::from_secs(1),
+            }
+            .daemon_error_code(),
+            DaemonErrorCode::ProveTimeout
         );
     }
 

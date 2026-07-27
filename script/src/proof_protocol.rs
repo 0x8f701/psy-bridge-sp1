@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
 pub const PROOF_SCHEMA_VERSION: u32 = 1;
 pub const PROOF_NAMESPACE_PREFIX: &str = "PDOGE-SP1-PROOF-V1";
 pub const GROTH16_PROOF_BYTES: usize = 356;
@@ -75,6 +76,7 @@ impl DaemonRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonIdentityResponse {
+    pub protocol_version: u32,
     pub kind: String,
     pub network: String,
     pub guest_id: String,
@@ -98,12 +100,23 @@ pub struct DaemonProofResponse {
     pub public_values: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DaemonErrorCode {
+    InvalidRequest,
+    InvalidInput,
+    ProofFailure,
+    ExecuteTimeout,
+    ProveTimeout,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonErrorResponse {
     pub kind: String,
     pub request_id: Option<String>,
     pub ok: bool,
+    pub code: DaemonErrorCode,
     pub error: String,
 }
 

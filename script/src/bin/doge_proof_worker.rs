@@ -1,9 +1,10 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use psy_bridge_sp1_script::proof_protocol::{
-    decode_hex_32, DaemonErrorResponse, DaemonIdentityResponse, DaemonProofResponse, ProofJob,
-    ProofJobState, ProofResultOutcome, QueueKeys, GROTH16_PROOF_BYTES, PROOF_NAMESPACE_PREFIX,
-    PROOF_SCHEMA_VERSION, PUBLIC_VALUES_BYTES,
+    decode_hex_32, DaemonErrorCode, DaemonErrorResponse, DaemonIdentityResponse,
+    DaemonProofResponse, ProofJob, ProofJobState, ProofResultOutcome, QueueKeys,
+    DAEMON_PROTOCOL_VERSION, GROTH16_PROOF_BYTES, PROOF_NAMESPACE_PREFIX, PROOF_SCHEMA_VERSION,
+    PUBLIC_VALUES_BYTES,
 };
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use serde_json::Value;
@@ -37,6 +38,7 @@ const PHASE_GRACE_SECS: u64 = 30;
 const MAX_PROTOCOL_LINE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 256 * 1024;
 const DAEMON_WRITE_TIMEOUT_SECS: u64 = 30;
+const DAEMON_EXIT_WAIT_SECS: u64 = 5;
 const REDIS_RETRY_MS: u64 = 250;
 const REDIS_OPERATION_TIMEOUT_SECS: u64 = 2;
 const REDIS_CONNECT_MAX_BACKOFF_SECS: u64 = 30;
@@ -502,10 +504,13 @@ impl WorkerFailure {
     }
 
     fn daemon_error(error: DaemonErrorResponse) -> Self {
-        if error.error.contains("timed out after") {
-            Self::transient(error.error)
-        } else {
-            Self::permanent(error.error)
+        match error.code {
+            DaemonErrorCode::ExecuteTimeout | DaemonErrorCode::ProveTimeout => {
+                Self::transient(error.error)
+            }
+            DaemonErrorCode::InvalidRequest
+            | DaemonErrorCode::InvalidInput
+            | DaemonErrorCode::ProofFailure => Self::permanent(error.error),
         }
     }
 }
@@ -550,6 +555,63 @@ struct GenProofDaemon {
     identity: DaemonIdentityResponse,
 }
 
+fn decode_daemon_identity(identity_line: &str, network: Network) -> Result<DaemonIdentityResponse> {
+    let identity: DaemonIdentityResponse =
+        serde_json::from_str(identity_line).context("decode gen-proof identity")?;
+    if identity.protocol_version != DAEMON_PROTOCOL_VERSION {
+        bail!(
+            "gen-proof daemon protocol version mismatch: expected {DAEMON_PROTOCOL_VERSION}, got {}",
+            identity.protocol_version
+        );
+    }
+    if identity.kind != "identity" || identity.network != network.as_str() {
+        bail!("unexpected gen-proof daemon identity: {identity_line}");
+    }
+    validate_digest("daemon ELF SHA", &identity.block_elf_sha256)?;
+    validate_digest("daemon vkey hash", &identity.vkey_hash)?;
+    Ok(identity)
+}
+
+struct ShutdownReport {
+    preexisting_status: Option<std::process::ExitStatus>,
+    detail: String,
+}
+
+async fn bounded_shutdown(child: &mut Child) -> ShutdownReport {
+    let inspect_error = match child.try_wait() {
+        Ok(Some(status)) => {
+            return ShutdownReport {
+                preexisting_status: Some(status),
+                detail: format!("gen-proof already exited with {status}"),
+            };
+        }
+        Ok(None) => None,
+        Err(error) => Some(error),
+    };
+
+    let kill_error = child.start_kill().err();
+    let wait_result = time::timeout(
+        Duration::from_secs(DAEMON_EXIT_WAIT_SECS),
+        child.wait(),
+    )
+    .await;
+    let mut details = Vec::with_capacity(3);
+    if let Some(error) = inspect_error {
+        details.push(format!("failed to inspect gen-proof before shutdown: {error}"));
+    }
+    if let Some(error) = kill_error {
+        details.push(format!("failed to kill gen-proof: {error}"));
+    }
+    match wait_result {
+        Ok(Ok(status)) => details.push(format!("gen-proof terminated with {status}")),
+        Ok(Err(error)) => details.push(format!("failed waiting for gen-proof: {error}")),
+        Err(_) => details.push(format!(
+            "gen-proof did not exit within {DAEMON_EXIT_WAIT_SECS}s after kill"
+        )),
+    }
+    ShutdownReport { preexisting_status: None, detail: details.join("; ") }
+}
+
 impl GenProofDaemon {
     async fn start(args: &Args) -> Result<Self> {
         let mut command = Command::new(&args.gen_proof_path);
@@ -560,46 +622,46 @@ impl GenProofDaemon {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = command.spawn().context("start gen-proof --daemon")?;
-        let stdin = child.stdin.take().context("capture gen-proof stdin")?;
-        let stdout = child.stdout.take().context("capture gen-proof stdout")?;
-        let mut stderr_reader = child.stderr.take().context("capture gen-proof stderr")?;
-        let stderr = Arc::new(Mutex::new(BoundedStderr::default()));
-        let stderr_sink = Arc::clone(&stderr);
-        tokio::spawn(async move {
-            let mut chunk = [0_u8; 8_192];
-            loop {
-                match stderr_reader.read(&mut chunk).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(read) => stderr_sink.lock().await.append(&chunk[..read]),
+        let startup_result: Result<_> = async {
+            let stdin = child.stdin.take().context("capture gen-proof stdin")?;
+            let stdout = child.stdout.take().context("capture gen-proof stdout")?;
+            let mut stderr_reader = child.stderr.take().context("capture gen-proof stderr")?;
+            let stderr = Arc::new(Mutex::new(BoundedStderr::default()));
+            let stderr_sink = Arc::clone(&stderr);
+            tokio::spawn(async move {
+                let mut chunk = [0_u8; 8_192];
+                loop {
+                    match stderr_reader.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => stderr_sink.lock().await.append(&chunk[..read]),
+                    }
                 }
-            }
-        });
-        let mut daemon = Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-            stderr,
-            identity: DaemonIdentityResponse {
-                kind: String::new(),
-                network: String::new(),
-                guest_id: String::new(),
-                block_elf_sha256: String::new(),
-                vkey_hash: String::new(),
-            },
-        };
-        let identity_line = time::timeout(
-            Duration::from_secs(args.setup_timeout_secs.saturating_add(PHASE_GRACE_SECS)),
-            read_protocol_line(&mut daemon.stdout),
-        )
-        .await
-        .map_err(|_| anyhow!("gen-proof setup/identity timed out"))??;
-        daemon.identity = serde_json::from_str(&identity_line).context("decode gen-proof identity")?;
-        if daemon.identity.kind != "identity" || daemon.identity.network != args.network.as_str() {
-            bail!("unexpected gen-proof daemon identity: {identity_line}");
+            });
+            let mut stdout = BufReader::new(stdout);
+            let identity_line = time::timeout(
+                Duration::from_secs(args.setup_timeout_secs.saturating_add(PHASE_GRACE_SECS)),
+                read_protocol_line(&mut stdout),
+            )
+            .await
+            .map_err(|_| anyhow!("gen-proof setup/identity timed out"))??;
+            let identity = decode_daemon_identity(&identity_line, args.network)?;
+            Ok((stdin, stdout, stderr, identity))
         }
-        validate_digest("daemon ELF SHA", &daemon.identity.block_elf_sha256)?;
-        validate_digest("daemon vkey hash", &daemon.identity.vkey_hash)?;
-        Ok(daemon)
+        .await;
+
+        match startup_result {
+            Ok((stdin, stdout, stderr, identity)) => {
+                Ok(Self { child, stdin, stdout, stderr, identity })
+            }
+            Err(error) => {
+                let shutdown = bounded_shutdown(&mut child).await;
+                let context = format!(
+                    "gen-proof startup failed: {error}; shutdown result: {}",
+                    shutdown.detail
+                );
+                Err(error.context(context))
+            }
+        }
     }
 
     async fn stderr_offset(&self) -> u64 {
@@ -655,12 +717,18 @@ impl GenProofDaemon {
     }
 
     async fn stop(mut self) {
-        let _ = self.child.kill().await;
-        let _ = self.child.wait().await;
+        let _ = bounded_shutdown(&mut self.child).await;
     }
 
-    async fn exit_failure(&mut self) -> WorkerFailure {
-        child_status_failure(self.child.wait().await)
+    async fn protocol_failure(&mut self, protocol_error: anyhow::Error) -> WorkerFailure {
+        let shutdown = bounded_shutdown(&mut self.child).await;
+        match shutdown.preexisting_status {
+            Some(status) => child_status_failure(Ok(status)),
+            None => WorkerFailure::transient(format!(
+                "gen-proof protocol failure: {protocol_error}; {}",
+                shutdown.detail
+            )),
+        }
     }
 }
 
@@ -675,6 +743,13 @@ fn child_status_failure(status: std::io::Result<std::process::ExitStatus>) -> Wo
 }
 
 async fn read_protocol_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<String> {
+    read_protocol_line_with_limit(reader, MAX_PROTOCOL_LINE_BYTES).await
+}
+
+async fn read_protocol_line_with_limit<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<String> {
     let mut line = Vec::new();
     loop {
         let buffer = reader.fill_buf().await.context("read gen-proof protocol")?;
@@ -685,8 +760,8 @@ async fn read_protocol_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<S
             .iter()
             .position(|byte| *byte == b'\n')
             .map_or(buffer.len(), |position| position + 1);
-        if line.len().saturating_add(take) > MAX_PROTOCOL_LINE_BYTES {
-            bail!("gen-proof protocol line exceeds {MAX_PROTOCOL_LINE_BYTES} bytes");
+        if line.len().saturating_add(take) > max_bytes {
+            bail!("gen-proof protocol line exceeds {max_bytes} bytes");
         }
         line.extend_from_slice(&buffer[..take]);
         reader.consume(take);
@@ -742,6 +817,7 @@ fn validate_digest(name: &str, value: &str) -> Result<()> {
 
 fn validate_daemon_identity(job: &ProofJob, identity: &DaemonIdentityResponse) -> Result<(), WorkerFailure> {
     if identity.kind != "identity"
+        || identity.protocol_version != DAEMON_PROTOCOL_VERSION
         || identity.network != job.network
         || identity.guest_id != job.guest_id
         || identity.block_elf_sha256 != job.block_elf_sha256
@@ -895,7 +971,7 @@ async fn prove_claim(
             line = read_protocol_line(&mut daemon.stdout) => {
                 match line {
                     Ok(line) => break line,
-                    Err(_) => return Err(daemon.exit_failure().await),
+                    Err(error) => return Err(daemon.protocol_failure(error).await),
                 }
             }
             _ = heartbeat.tick() => {
@@ -1110,6 +1186,35 @@ mod tests {
     }
 
     #[test]
+    fn daemon_identity_protocol_version_is_required_and_strict() {
+        let mut value = serde_json::json!({
+            "kind": "identity",
+            "protocol_version": DAEMON_PROTOCOL_VERSION,
+            "network": "regtest",
+            "guest_id": "block-transition",
+            "block_elf_sha256": "11".repeat(32),
+            "vkey_hash": "22".repeat(32),
+        });
+
+        let current = decode_daemon_identity(&value.to_string(), Network::Regtest).unwrap();
+        assert_eq!(current.protocol_version, DAEMON_PROTOCOL_VERSION);
+
+        value["protocol_version"] = serde_json::json!(DAEMON_PROTOCOL_VERSION + 1);
+        let wrong_version = decode_daemon_identity(&value.to_string(), Network::Regtest).unwrap_err();
+        assert!(wrong_version.to_string().contains(
+            &format!(
+                "protocol version mismatch: expected {DAEMON_PROTOCOL_VERSION}, got {}",
+                DAEMON_PROTOCOL_VERSION + 1
+            )
+        ));
+
+        value.as_object_mut().unwrap().remove("protocol_version");
+        let missing_version = decode_daemon_identity(&value.to_string(), Network::Regtest).unwrap_err();
+        assert!(missing_version.to_string().contains("decode gen-proof identity"));
+        assert!(format!("{missing_version:#}").contains("missing field `protocol_version`"));
+    }
+
+    #[test]
     fn matches_ibc_canonical_proof_job_fixture() {
         let request = DaemonRequest {
             request_id: "block-42".to_owned(),
@@ -1156,6 +1261,7 @@ mod tests {
             kind: "proof".to_owned(),
             request_id: Some("request-42".to_owned()),
             ok: false,
+            code: DaemonErrorCode::ProveTimeout,
             error: "prove timed out after 12s".to_owned(),
         });
         assert!(daemon_timeout.retryable);
@@ -1215,6 +1321,42 @@ mod tests {
         let error = read_protocol_line(&mut input).await.unwrap_err();
         assert!(error.to_string().contains("exceeds"));
         assert_eq!(input.buffer().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_shutdown_terminates_and_reaps_live_child() {
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 60"])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let started = Instant::now();
+        let shutdown = bounded_shutdown(&mut child).await;
+
+        assert!(started.elapsed() <= Duration::from_secs(DAEMON_EXIT_WAIT_SECS + 1));
+        assert!(shutdown.preexisting_status.is_none());
+        assert!(shutdown.detail.contains("gen-proof terminated with"));
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn bounded_shutdown_handles_already_exited_child() {
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 7"])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let status = time::timeout(Duration::from_secs(1), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.code(), Some(7));
+
+        let shutdown = bounded_shutdown(&mut child).await;
+
+        assert_eq!(shutdown.preexisting_status.and_then(|status| status.code()), Some(7));
+        assert!(shutdown.detail.contains("already exited"));
     }
 
     fn build_args(overrides: &[&str]) -> Args {
@@ -1576,12 +1718,13 @@ mod tests {
     }
 
     #[test]
-    fn daemon_error_treats_timeout_substring_as_retryable_otherwise_permanent() {
+    fn daemon_error_classification_uses_code_not_message() {
         let timeout = WorkerFailure::daemon_error(DaemonErrorResponse {
             kind: "proof".to_owned(),
             request_id: Some("r".to_owned()),
             ok: false,
-            error: "prove timed out after 7200s".to_owned(),
+            code: DaemonErrorCode::ProveTimeout,
+            error: "message without timeout words".to_owned(),
         });
         assert!(timeout.retryable);
         assert!(timeout.restart_daemon);
@@ -1590,7 +1733,8 @@ mod tests {
             kind: "proof".to_owned(),
             request_id: Some("r".to_owned()),
             ok: false,
-            error: "guest exited with code 1".to_owned(),
+            code: DaemonErrorCode::ProofFailure,
+            error: "prove timed out after 7200s".to_owned(),
         });
         assert!(!logic.retryable);
         assert!(!logic.restart_daemon);
@@ -1644,6 +1788,7 @@ mod tests {
         let job = fixture_job();
         let base = DaemonIdentityResponse {
             kind: "identity".to_owned(),
+            protocol_version: DAEMON_PROTOCOL_VERSION,
             network: job.network.clone(),
             guest_id: job.guest_id.clone(),
             block_elf_sha256: job.block_elf_sha256.clone(),
@@ -1653,6 +1798,7 @@ mod tests {
 
         let mismatches: &[(fn(&mut DaemonIdentityResponse) -> (), &str)] = &[
             (|id| id.kind = "proof".to_owned(), "identity does not match"),
+            (|id| id.protocol_version += 1, "identity does not match"),
             (|id| id.network = "testnet".to_owned(), "identity does not match"),
             (|id| id.guest_id = "other-guest".to_owned(), "identity does not match"),
             (
