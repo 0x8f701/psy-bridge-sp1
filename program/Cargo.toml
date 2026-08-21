@@ -26,3 +26,4 @@ psy-bridge-sp1-lib = { path = "../lib" }
 sp1-zkvm.workspace = true
 doge-light-client = { path = "../../dlc-lib/doge-light-client-workspace/doge-light-client", default-features = false, features = ["sp1", "serialize_bytemuck", "serialize_borsh"] }
 psy-doge-bridge-helper = { path = "../../dlc-lib/doge-light-client-workspace/psy-doge-bridge-helper", default-features = false, features = ["sha2", "serialize_bytemuck", "serialize_borsh", "serialize_speedy"] }
+speedy = "0.8.7"

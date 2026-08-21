@@ -8,8 +8,15 @@ use psy_doge_bridge_helper::{
     block_transition::prover_guest::{
         prover_guest_run_with_bytes, prover_guest_verify_block_transition_detailed,
     },
+    claim::{
+        auto_claim_deposits_tree::pending_mints_buffer_builder::PendingMintsGroupsBuilder,
+        transition::validator::block_witness::pending_mint_and_txo_hashes_from_claim_witness,
+    },
+    data::core::PsyDogeBridgeIncomingBlockWitness,
     tx_template::{CustodyScriptConfig, LocalRegtestManagerCustody},
 };
+use doge_light_client::hash::sha256_impl::hash_impl_sha256_bytes;
+use speedy::Readable;
 
 const SOLANA_HEADER_SIZE: usize = 320;
 const CONFIG_PARAMS_SIZE: usize = 48;
@@ -19,8 +26,8 @@ const CONFIG_PARAMS_SIZE: usize = 48;
 const FS_OFFSET: usize = 72;
 const FS_BLOCK_HASH: usize = FS_OFFSET + 0; // 32 bytes
 const FS_BLOCK_MERKLE_ROOT: usize = FS_OFFSET + 32; // 32 bytes
-                                                    // FS_PENDING_MINTS_HASH at +64 — Solana-only, not checked
-                                                    // FS_TXO_LIST_HASH at +96 — Solana-only, not checked
+const FS_PENDING_MINTS_HASH: usize = FS_OFFSET + 64; // 32 bytes
+const FS_TXO_LIST_HASH: usize = FS_OFFSET + 96; // 32 bytes
 const FS_AUTO_CLAIMED_TXO_ROOT: usize = FS_OFFSET + 128; // 32 bytes
 const FS_AUTO_CLAIMED_DEPOSITS_ROOT: usize = FS_OFFSET + 160; // 32 bytes
 const FS_AUTO_CLAIMED_NEXT_INDEX: usize = FS_OFFSET + 192; // u32 LE
@@ -51,6 +58,7 @@ pub fn main() {
 
     let config_params = sp1_zkvm::io::read_vec();
     assert_eq!(config_params.len(), CONFIG_PARAMS_SIZE);
+    let finalized_witness_bytes = sp1_zkvm::io::read_vec();
     let custodian_hash = custody_script_config.hash::<LocalRegtestManagerCustody>();
 
     // --- Build helper input and verify ---
@@ -82,6 +90,47 @@ pub fn main() {
     // Check overlapping fields between helper's finalized_state and Solana header bytes.
     verify_finalized_state_fields(&solana_old_header, &verified.old_finalized_state, "old");
     verify_finalized_state_fields(&solana_new_header, &verified.new_finalized_state, "new");
+    let (pending_mints_hash, txo_output_list_hash) = if finalized_witness_bytes.is_empty() {
+        (
+            PendingMintsGroupsBuilder::new_with_hint(0)
+                .finalize()
+                .expect("failed to finalize empty pending mints"),
+            hash_impl_sha256_bytes(&[]),
+        )
+    } else {
+        let finalized_witness =
+            PsyDogeBridgeIncomingBlockWitness::read_from_buffer(&finalized_witness_bytes)
+                .expect("failed to parse finalized witness");
+        assert_eq!(
+            finalized_witness.block_header.get_hash(),
+            verified.new_finalized_state.block_hash,
+            "finalized witness block hash mismatch"
+        );
+        assert_eq!(
+            finalized_witness.block_header.header.merkle_root,
+            verified.new_finalized_state.block_merkle_tree_root,
+            "finalized witness merkle root mismatch"
+        );
+        pending_mint_and_txo_hashes_from_claim_witness::<LocalRegtestManagerCustody>(
+            &finalized_witness.claim_witness,
+            finalized_witness.block_header.header.merkle_root,
+            &custody_script_config,
+            flat_fee,
+            fee_num,
+            fee_den,
+        )
+        .expect("failed to recompute finalized pending mint/TXO hashes")
+    };
+    assert_eq!(
+        &solana_new_header[FS_PENDING_MINTS_HASH..FS_PENDING_MINTS_HASH + 32],
+        pending_mints_hash.as_slice(),
+        "new header pending_mints_finalized_hash mismatch"
+    );
+    assert_eq!(
+        &solana_new_header[FS_TXO_LIST_HASH..FS_TXO_LIST_HASH + 32],
+        txo_output_list_hash.as_slice(),
+        "new header txo_output_list_finalized_hash mismatch"
+    );
 
     // --- Compute public inputs from Solana header bytes ---
     let old_header_hash = sha256(&solana_old_header);
@@ -97,10 +146,8 @@ pub fn main() {
     sp1_zkvm::io::commit(&public_inputs);
 }
 
-/// Verify that the consensus-related fields in a Solana PsyBridgeHeader
+/// Verify that the finalized-state fields in a Solana PsyBridgeHeader
 /// (320 bytes) match the helper's verified finalized_state.
-/// Solana-only fields (pending_mints_finalized_hash, txo_output_list_finalized_hash)
-/// are NOT checked here — they're verified on-chain via buffer hashes.
 fn verify_finalized_state_fields(
     solana_header: &[u8],
     verified_state: &doge_light_client::block_state::PsyBridgeStateCommitment,

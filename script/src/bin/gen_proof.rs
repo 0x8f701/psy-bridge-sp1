@@ -147,6 +147,10 @@ struct Args {
     #[arg(long, required_unless_present_any = ["vkey_only", "daemon"])]
     witness: Option<String>,
 
+    /// Finalized-height incoming witness bytes as hex, or @path/path to a file containing hex; empty for genesis.
+    #[arg(long, required_unless_present_any = ["vkey_only", "daemon"])]
+    finalized_witness: Option<String>,
+
     /// 32-byte manager custody script config (emitter bridge PDA) as hex, or @path/path to a file containing hex.
     #[arg(long, required_unless_present_any = ["vkey_only", "daemon"])]
     custody_script_config: Option<String>,
@@ -193,6 +197,7 @@ impl Args {
 struct BlockTransitionInputs {
     old_state: Vec<u8>,
     witness: Vec<u8>,
+    finalized_witness: Vec<u8>,
     custody_script_config: Vec<u8>,
     required_confirmations: u32,
     flat_fee: u64,
@@ -208,6 +213,7 @@ struct DaemonRequest {
     request_id: String,
     old_state: String,
     witness: String,
+    finalized_witness: String,
     custody_script_config: String,
     required_confirmations: u32,
     flat_fee: u64,
@@ -316,6 +322,7 @@ impl BlockTransitionInputs {
         stdin.write_vec(self.old_header);
         stdin.write_vec(self.new_header);
         stdin.write_vec(self.config_params);
+        stdin.write_vec(self.finalized_witness);
         stdin
     }
 }
@@ -386,6 +393,10 @@ impl DaemonRequest {
         Ok(BlockTransitionInputs {
             old_state: decode_inline_hex_bytes(&self.old_state, "old state")?,
             witness: decode_inline_hex_bytes(&self.witness, "witness")?,
+            finalized_witness: decode_inline_hex_bytes(
+                &self.finalized_witness,
+                "finalized witness",
+            )?,
             custody_script_config: decode_inline_hex_input(
                 &self.custody_script_config,
                 "custody script config",
@@ -415,6 +426,12 @@ fn args_into_inputs(args: Args) -> Result<BlockTransitionInputs, Box<dyn Error>>
         witness: read_hex_bytes(
             args.witness.as_deref().expect("required by clap"),
             "witness",
+        )?,
+        finalized_witness: read_hex_bytes(
+            args.finalized_witness
+                .as_deref()
+                .expect("required by clap"),
+            "finalized witness",
         )?,
         custody_script_config: read_hex_input(
             args.custody_script_config
@@ -767,6 +784,8 @@ mod tests {
             "00",
             "--witness",
             "01",
+            "--finalized-witness",
+            "",
             "--custody-script-config",
             &"02".repeat(32),
             "--required-confirmations",
@@ -1001,6 +1020,7 @@ mod tests {
         let stdin = BlockTransitionInputs {
             old_state: vec![0],
             witness: vec![1],
+            finalized_witness: vec![34],
             custody_script_config: vec![2; 32],
             required_confirmations: 0x0605_0403,
             flat_fee: 0x0e0d_0c0b_0a09_0807,
@@ -1012,7 +1032,7 @@ mod tests {
         }
         .into_stdin();
 
-        assert_eq!(stdin.buffer.len(), 10);
+        assert_eq!(stdin.buffer.len(), 11);
         assert_eq!(stdin.buffer[0], [0]);
         assert_eq!(stdin.buffer[1], [1]);
         assert_eq!(stdin.buffer[2], [2; 32]);
@@ -1023,6 +1043,7 @@ mod tests {
         assert_eq!(stdin.buffer[7], vec![31; 320]);
         assert_eq!(stdin.buffer[8], vec![32; 320]);
         assert_eq!(stdin.buffer[9], vec![33; 48]);
+        assert_eq!(stdin.buffer[10], [34]);
     }
 
     #[test]
@@ -1055,6 +1076,7 @@ mod tests {
             request_id: "req-inline".to_owned(),
             old_state,
             witness: "01".to_owned(),
+            finalized_witness: String::new(),
             custody_script_config: "02".repeat(32),
             required_confirmations: 6,
             flat_fee: 7,

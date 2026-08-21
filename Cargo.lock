@@ -2919,6 +2919,7 @@ dependencies = [
  "psy-bridge-sp1-lib",
  "psy-doge-bridge-helper",
  "sp1-zkvm",
+ "speedy",
 ]
 
 [[package]]

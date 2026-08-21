@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
-pub const PROOF_SCHEMA_VERSION: u32 = 1;
-pub const PROOF_NAMESPACE_PREFIX: &str = "PDOGE-SP1-PROOF-V1";
+pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
+pub const PROOF_SCHEMA_VERSION: u32 = 2;
+pub const PROOF_NAMESPACE_PREFIX: &str = "PDOGE-SP1-PROOF-V2";
 pub const GROTH16_PROOF_BYTES: usize = 356;
 pub const PUBLIC_VALUES_BYTES: usize = 32;
 
@@ -57,6 +57,7 @@ pub struct DaemonRequest {
     pub request_id: String,
     pub old_state: String,
     pub witness: String,
+    pub finalized_witness: String,
     pub custody_script_config: String,
     pub required_confirmations: u32,
     pub flat_fee: u64,

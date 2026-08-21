@@ -1115,7 +1115,7 @@ mod tests {
 
     fn fixture_job() -> ProofJob {
         let mut job = ProofJob {
-            schema_version: 1,
+            schema_version: PROOF_SCHEMA_VERSION,
             job_id: String::new(),
             network: "regtest".to_owned(),
             height: 42,
@@ -1128,6 +1128,7 @@ mod tests {
                 request_id: "request-42".to_owned(),
                 old_state: "00".to_owned(),
                 witness: "01".to_owned(),
+                finalized_witness: String::new(),
                 custody_script_config: "02".repeat(32),
                 required_confirmations: 6,
                 flat_fee: 7,
@@ -1144,14 +1145,14 @@ mod tests {
     }
 
     #[test]
-    fn namespace_and_keys_match_v1_contract() {
+    fn namespace_and_keys_match_v2_contract() {
         let keys = QueueKeys::new(PROOF_NAMESPACE_PREFIX, "regtest", "alpha");
-        assert_eq!(keys.namespace, "PDOGE-SP1-PROOF-V1-regtest-alpha");
-        assert_eq!(keys.queue, "PDOGE-SP1-PROOF-V1-regtest-alpha:queue");
-        assert_eq!(keys.job("abc"), "PDOGE-SP1-PROOF-V1-regtest-alpha:job:abc");
-        assert_eq!(keys.state("abc"), "PDOGE-SP1-PROOF-V1-regtest-alpha:state:abc");
-        assert_eq!(keys.result("abc"), "PDOGE-SP1-PROOF-V1-regtest-alpha:result:abc");
-        assert_eq!(keys.attempt("abc"), "PDOGE-SP1-PROOF-V1-regtest-alpha:attempt:abc");
+        assert_eq!(keys.namespace, "PDOGE-SP1-PROOF-V2-regtest-alpha");
+        assert_eq!(keys.queue, "PDOGE-SP1-PROOF-V2-regtest-alpha:queue");
+        assert_eq!(keys.job("abc"), "PDOGE-SP1-PROOF-V2-regtest-alpha:job:abc");
+        assert_eq!(keys.state("abc"), "PDOGE-SP1-PROOF-V2-regtest-alpha:state:abc");
+        assert_eq!(keys.result("abc"), "PDOGE-SP1-PROOF-V2-regtest-alpha:result:abc");
+        assert_eq!(keys.attempt("abc"), "PDOGE-SP1-PROOF-V2-regtest-alpha:attempt:abc");
         let custom = QueueKeys::new("custom", "testnet", "seed");
         assert_eq!(custom.notify, "custom-testnet-seed:notify");
         assert_eq!(custom.leases, "custom-testnet-seed:leases");
@@ -1220,6 +1221,7 @@ mod tests {
             request_id: "block-42".to_owned(),
             old_state: "00".to_owned(),
             witness: "11".to_owned(),
+            finalized_witness: String::new(),
             custody_script_config: "22".repeat(32),
             required_confirmations: 6,
             flat_fee: 1,
@@ -1232,7 +1234,7 @@ mod tests {
         let input_fingerprint = request.computed_input_fingerprint().unwrap();
         assert_eq!(
             input_fingerprint,
-            "ba73eedbac6975d7a2b944837ffae63840a78406fa212078fec0febf7ea5cb63"
+            "d4c614aabb9a4514d37497c7f85ca12bb8787433a8325ecbe1a534a13e727b7e"
         );
         let job = ProofJob {
             schema_version: PROOF_SCHEMA_VERSION,
@@ -1248,7 +1250,7 @@ mod tests {
         };
         assert_eq!(
             job.computed_job_id().unwrap(),
-            "7732a5cfeec448e8bab07195b32b42758b67de66b1ab5d162384ff020e850db5"
+            "4ad41f1f9a93976bba08fe7a0b419e9526ac0ed4ce894e37f82abeac6dd83f94"
         );
     }
 

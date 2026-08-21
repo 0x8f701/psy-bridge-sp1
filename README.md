@@ -73,7 +73,7 @@ target/release/gen-proof
 
 ### 精确 stdin 布局
 
-Guest 依次调用十次 `sp1_zkvm::io::read_vec()`；因此这是 **十个 SP1 framed vector**，不能拼成一个无 framing 的 blob：
+Guest 依次调用十一次 `sp1_zkvm::io::read_vec()`；因此这是 **十一个 SP1 framed vector**，不能拼成一个无 framing 的 blob：
 
 | 顺序 | CLI option                   | 解码后长度 | 含义 |
 | ---: | ---------------------------- | ---------: | ---- |
@@ -87,12 +87,13 @@ Guest 依次调用十次 `sp1_zkvm::io::read_vec()`；因此这是 **十个 SP1 
 |    8 | `--old-header`               |  320 bytes | 旧 Solana `PsyBridgeHeader` canonical `#[repr(C)]` bytes。 |
 |    9 | `--new-header`               |  320 bytes | 新 Solana `PsyBridgeHeader` canonical `#[repr(C)]` bytes。 |
 |   10 | `--config-params`            |   48 bytes | Bridge config canonical `#[repr(C)]` bytes。 |
+|   11 | `--finalized-witness`        | 可变       | Speedy 编码的 finalized-height incoming witness；空 hex 表示 genesis / 尚未处理该 finalized height。 |
 
-Host 对 custody script config、两个 header 和 config 做精确长度检查；state/witness 由 guest 中的 Borsh/Speedy parser 完整消费。所有 byte options 接受内联 hex、`0x` 前缀、`@path/to/file` 或直接存在的文件路径；文件内容仍须是 hex 文本，解析会去掉 ASCII whitespace。
+Host 对 custody script config、两个 header 和 config 做精确长度检查；state/tip witness/finalized witness 由 guest 中的 Borsh/Speedy parser 完整消费，且空 finalized witness 编码为第 11 个空 vector。所有 byte options 接受内联 hex、`0x` 前缀、`@path/to/file` 或直接存在的文件路径；文件内容仍须是 hex 文本，解析会去掉 ASCII whitespace。
 
 ### Guest 验证与 public value
 
-Guest 先解析旧 state 和 witness，并通过 `prover_guest_verify_block_transition_detailed::<DogeRegTestConfig>` 检查 block/witness transition。随后它检查旧/新 Solana header 的 finalized block hash、Merkle root、auto-claim roots/index 和 block height与验证结果一致。Solana-only pending-mint/TXO-buffer hashes由链上 buffer checks 验证，不在 guest 中重复检查。
+Guest 先解析旧 state 和 tip witness，并通过对应网络的 `prover_guest_verify_block_transition_detailed` 检查 block/witness transition。随后它检查旧/新 Solana header 的 finalized block hash、Merkle root、auto-claim roots/index 和 block height与验证结果一致。第 11 个 finalized-height witness 为空时，新 header 的 pending-mint/TXO hashes 必须等于规范空 hash；非空时，guest 将其 block hash 和 Merkle root 绑定到验证后的 `new_finalized_state`，再用相同 manager-custody profile 与 fee 参数重算并绑定这两个 hash。
 
 最后 guest 与 host 使用同一 public-value 公式：
 
@@ -118,6 +119,7 @@ cargo run --release -p psy-bridge-sp1-script --bin gen-proof -- \
   --network regtest \
   --old-state <hex-or-@file> \
   --witness <hex-or-@file> \
+  --finalized-witness <hex-or-@file-or-empty> \
   --custody-script-config <32-byte-hex-or-@file> \
   --required-confirmations <u32> \
   --flat-fee <u64> \
@@ -135,6 +137,7 @@ cargo run --release -p psy-bridge-sp1-script --bin gen-proof -- \
   --network testnet \
   --old-state <hex-or-@file> \
   --witness <hex-or-@file> \
+  --finalized-witness <hex-or-@file-or-empty> \
   --custody-script-config <32-byte-hex-or-@file> \
   --required-confirmations <u32> \
   --flat-fee <u64> \
